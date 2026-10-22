@@ -6,7 +6,6 @@ defmodule QueueParty.RoomsTest do
   test "room settings and playback reports authenticate the host at the state boundary" do
     {:ok, room} = Rooms.create_room()
     {:ok, item} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
-    Rooms.skip(room.code)
 
     assert {:error, :forbidden} = Rooms.set_playback_mode(room.code, "wrong-token", "everyone")
 
@@ -28,7 +27,6 @@ defmodule QueueParty.RoomsTest do
   test "the snapshot advances while playing and holds its position while paused or buffering" do
     {:ok, room} = Rooms.create_room()
     {:ok, item} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
-    Rooms.skip(room.code)
 
     assert :ok = Rooms.update_playback(room.code, room.host_token, item.id, "playing", 35.0)
     assert Rooms.playback_snapshot(Rooms.get_room(room.code)).position >= 35.0

@@ -170,11 +170,26 @@ export default {
 
   updated() {
     if (this.disposed) return
+    const wasHost = this.isHost
+    this.isHost = this.el.dataset.host === "true"
     const snapshot = {
       item_id: this.el.dataset.itemId,
       status: this.el.dataset.playbackStatus,
       position: Number(this.el.dataset.playbackPosition) || 0,
       revision: Number(this.el.dataset.playbackRevision) || 0
+    }
+    if (wasHost !== this.isHost) {
+      this.snapshot = snapshot
+      this.snapshotAt = performance.now()
+      if (this.isHost) {
+        if (this.ready && this.player.getPlayerState() === window.YT.PlayerState.ENDED && this.playingItemId === snapshot.item_id) {
+          this.pushEvent("video_ended", {item_id: snapshot.item_id})
+        } else {
+          this.reportHost()
+        }
+      } else {
+        this.syncGuest(true)
+      }
     }
     if (this.isHost && this.activeItemId !== snapshot.item_id) {
       this.snapshot = snapshot

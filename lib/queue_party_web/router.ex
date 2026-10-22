@@ -4,6 +4,7 @@ defmodule QueuePartyWeb.Router do
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
+    plug :ensure_guest_id
     plug :fetch_live_flash
     plug :put_root_layout, html: {QueuePartyWeb.Layouts, :root}
     plug :protect_from_forgery
@@ -12,6 +13,18 @@ defmodule QueuePartyWeb.Router do
 
   pipeline :api do
     plug :accepts, ["json"]
+  end
+
+  defp ensure_guest_id(conn, _opts) do
+    if get_session(conn, :guest_id) do
+      conn
+    else
+      put_session(
+        conn,
+        :guest_id,
+        Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+      )
+    end
   end
 
   scope "/", QueuePartyWeb do

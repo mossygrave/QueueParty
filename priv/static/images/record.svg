@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>QueueParty vinyl record</title>
+  <circle cx="32" cy="32" r="31" fill="#f3f0e8"/>
+  <circle cx="32" cy="32" r="29" fill="#161616"/>
+  <g fill="none" stroke="#414141" stroke-width="2">
+    <circle cx="32" cy="32" r="23"/>
+    <circle cx="32" cy="32" r="18"/>
+  </g>
+  <path d="M12 26A21 21 0 0 1 26 12" fill="none" stroke="#777" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="32" cy="32" r="12" fill="#ff5a36"/>
+  <circle cx="32" cy="32" r="4" fill="#f3f0e8"/>
+</svg>

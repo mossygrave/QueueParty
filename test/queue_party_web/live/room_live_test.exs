@@ -19,9 +19,17 @@ defmodule QueuePartyWeb.RoomLiveTest do
     {:ok, guest, _} = live(build_conn(), ~p"/room/#{room.code}")
     guest |> form("#participant-name", name: "Morgan") |> render_change()
     guest |> form("#add-video", url: "https://youtu.be/dQw4w9WgXcQ") |> render_submit()
+
+    assert has_element?(
+             host,
+             "#youtube-player[data-video-id='dQw4w9WgXcQ'][data-playback-status='playing']"
+           )
+
+    assert has_element?(guest, "#now-playing", "Morgan")
+    refute has_element?(host, "#play-first")
+    guest |> form("#add-video", url: "https://youtu.be/M7lc1UVf-VE") |> render_submit()
     assert has_element?(host, "#queue li .queue-copy small", "Morgan")
     assert has_element?(guest, "#queue li")
-    assert has_element?(host, "#play-first")
     refute has_element?(guest, "#play-first")
   end
 
@@ -32,7 +40,6 @@ defmodule QueuePartyWeb.RoomLiveTest do
     {:ok, first} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
     {:ok, second} = Rooms.add_item(room.code, "M7lc1UVf-VE", "B")
     {:ok, host, _} = live(conn, ~p"/room/#{room.code}?host=#{room.host_token}")
-    host |> element("#play-first") |> render_click()
     assert has_element?(host, "#youtube-player[data-video-id='dQw4w9WgXcQ']")
     render_hook(host, "video_ended", %{"item_id" => first.id})
     assert has_element?(host, "#youtube-player[data-video-id='M7lc1UVf-VE']")
@@ -44,15 +51,40 @@ defmodule QueuePartyWeb.RoomLiveTest do
     assert Rooms.get_room(room.code).now_playing == nil
   end
 
-  test "guests cannot remove, start, or finish videos", %{conn: conn} do
+  test "guest submissions autostart everyone mode, including after the queue ends", %{conn: conn} do
+    {:ok, room} = Rooms.create_room()
+    Rooms.set_playback_mode(room.code, room.host_token, "everyone")
+    {:ok, host, _} = live(conn, ~p"/room/#{room.code}?host=#{room.host_token}")
+    {:ok, guest, _} = live(build_conn(), ~p"/room/#{room.code}")
+    guest |> form("#add-video", url: "https://youtu.be/dQw4w9WgXcQ") |> render_submit()
+    first = Rooms.get_room(room.code).now_playing
+    assert has_element?(host, "#youtube-player[data-playback-status='playing']")
+    assert has_element?(guest, "#youtube-player[data-playback-status='playing']")
+    refute has_element?(host, "#play-first")
+    render_hook(host, "video_ended", %{"item_id" => first.id})
+    refute has_element?(host, "#youtube-player")
+    guest |> form("#add-video", url: "https://youtu.be/M7lc1UVf-VE") |> render_submit()
+
+    assert has_element?(
+             host,
+             "#youtube-player[data-video-id='M7lc1UVf-VE'][data-playback-status='playing']"
+           )
+
+    assert has_element?(
+             guest,
+             "#youtube-player[data-video-id='M7lc1UVf-VE'][data-playback-status='playing']"
+           )
+  end
+
+  test "guests cannot remove, directly skip, or finish videos", %{conn: conn} do
     {:ok, room} = Rooms.create_room()
     {:ok, first} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
+    {:ok, second} = Rooms.add_item(room.code, "M7lc1UVf-VE", "B")
     {:ok, guest, _} = live(conn, ~p"/room/#{room.code}")
-    render_hook(guest, "remove", %{"id" => first.id})
+    render_hook(guest, "remove", %{"id" => second.id})
     render_hook(guest, "skip", %{})
-    assert Rooms.get_room(room.code).now_playing == nil
+    assert Rooms.get_room(room.code).now_playing.id == first.id
     assert length(Rooms.get_room(room.code).items) == 1
-    Rooms.skip(room.code)
     render_hook(guest, "video_ended", %{"item_id" => first.id})
     assert Rooms.get_room(room.code).now_playing.id == first.id
     refute has_element?(guest, "#youtube-player")
@@ -68,10 +100,20 @@ defmodule QueuePartyWeb.RoomLiveTest do
     assert has_element?(guest, "#queue-empty")
   end
 
+  test "expired room invites redirect home and the join form rejects their code", %{conn: conn} do
+    {:ok, room} = Rooms.create_room()
+    {_, marker} = room.empty_timer
+    send(Process.whereis(Rooms), {:empty_room_expired, room.code, marker})
+    assert Rooms.get_room(room.code) == nil
+    assert {:error, {:redirect, %{to: "/"}}} = live(conn, ~p"/room/#{room.code}")
+    {:ok, home, _} = live(build_conn(), ~p"/")
+    home |> form("#join-room", code: room.code) |> render_submit()
+    assert has_element?(home, "#join-error")
+  end
+
   test "only the host can change listening mode, including during playback", %{conn: conn} do
     {:ok, room} = Rooms.create_room()
     {:ok, item} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
-    Rooms.skip(room.code)
     {:ok, host, _} = live(conn, ~p"/room/#{room.code}?host=#{room.host_token}")
     {:ok, guest, _} = live(build_conn(), ~p"/room/#{room.code}")
 
@@ -98,7 +140,6 @@ defmodule QueuePartyWeb.RoomLiveTest do
     {:ok, room} = Rooms.create_room()
     {:ok, item} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
     item_id = item.id
-    Rooms.skip(room.code)
     Rooms.set_playback_mode(room.code, room.host_token, "everyone")
     {:ok, host, _} = live(conn, ~p"/room/#{room.code}?host=#{room.host_token}")
     {:ok, guest, _} = live(build_conn(), ~p"/room/#{room.code}")
@@ -136,7 +177,6 @@ defmodule QueuePartyWeb.RoomLiveTest do
     {:ok, first} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
     {:ok, second} = Rooms.add_item(room.code, "M7lc1UVf-VE", "B")
     Rooms.set_playback_mode(room.code, room.host_token, "everyone")
-    Rooms.skip(room.code)
     {:ok, host, _} = live(conn, ~p"/room/#{room.code}?host=#{room.host_token}")
     {:ok, guest, _} = live(build_conn(), ~p"/room/#{room.code}")
 

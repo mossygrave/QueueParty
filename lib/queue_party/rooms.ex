@@ -4,6 +4,8 @@ defmodule QueueParty.Rooms do
   use GenServer
 
   @topic_prefix "room:"
+  @host_grace_ms 30_000
+  @empty_room_ms :timer.minutes(15)
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
 
@@ -12,6 +14,27 @@ defmodule QueueParty.Rooms do
   def get_room(code), do: GenServer.call(__MODULE__, {:get, String.upcase(code)})
   def subscribe(code), do: Phoenix.PubSub.subscribe(QueueParty.PubSub, topic(code))
 
+  def join_room(code, guest_id, host_token, name),
+    do: GenServer.call(__MODULE__, {:join, String.upcase(code), guest_id, host_token, name})
+
+  def rename_guest(code, guest_id, name),
+    do: GenServer.call(__MODULE__, {:rename_guest, String.upcase(code), guest_id, name})
+
+  def transfer_host(code, host_token, guest_id),
+    do: GenServer.call(__MODULE__, {:transfer_host, String.upcase(code), host_token, guest_id})
+
+  def host?(room, guest_id, host_token) do
+    (is_binary(guest_id) && room.host_guest_id == guest_id) ||
+      (is_nil(room.host_guest_id) && room.host_token == host_token)
+  end
+
+  def connected_guests(room) do
+    room.participants
+    |> Map.values()
+    |> Enum.filter(&(map_size(&1.connections) > 0 && &1.id != room.host_guest_id))
+    |> Enum.sort_by(& &1.order)
+  end
+
   def add_item(code, youtube_id, submitted_by) do
     GenServer.call(__MODULE__, {:add_item, String.upcase(code), youtube_id, submitted_by})
   end
@@ -19,10 +42,40 @@ defmodule QueueParty.Rooms do
   def remove_item(code, item_id),
     do: GenServer.call(__MODULE__, {:remove_item, String.upcase(code), item_id})
 
+  def remove_item(code, item_id, host_token),
+    do:
+      GenServer.call(
+        __MODULE__,
+        {:host_action, String.upcase(code), host_token, {:remove_item, item_id}}
+      )
+
   def skip(code), do: GenServer.call(__MODULE__, {:skip, String.upcase(code)})
+
+  def skip(code, host_token),
+    do: GenServer.call(__MODULE__, {:host_action, String.upcase(code), host_token, :skip})
+
+  def request_skip(code, item_id, guest_id),
+    do: GenServer.call(__MODULE__, {:request_skip, String.upcase(code), item_id, guest_id})
+
+  def approve_skip(code, host_token, item_id),
+    do: GenServer.call(__MODULE__, {:approve_skip, String.upcase(code), host_token, item_id})
+
+  def set_skip_threshold(code, host_token, threshold),
+    do:
+      GenServer.call(
+        __MODULE__,
+        {:set_skip_threshold, String.upcase(code), host_token, threshold}
+      )
 
   def finish(code, item_id),
     do: GenServer.call(__MODULE__, {:finish, String.upcase(code), item_id})
+
+  def finish(code, item_id, host_token),
+    do:
+      GenServer.call(
+        __MODULE__,
+        {:host_action, String.upcase(code), host_token, {:finish, item_id}}
+      )
 
   def set_playback_mode(code, host_token, mode),
     do: GenServer.call(__MODULE__, {:set_playback_mode, String.upcase(code), host_token, mode})
@@ -57,9 +110,17 @@ defmodule QueueParty.Rooms do
     room = %{
       code: code,
       host_token: token(),
+      host_guest_id: nil,
+      host_status: "unclaimed",
+      host_timer: nil,
+      empty_timer: nil,
+      participants: %{},
+      join_sequence: 0,
       items: [],
       now_playing: nil,
       playback_mode: "host_only",
+      skip_threshold: 3,
+      skip_votes: MapSet.new(),
       playback: %{
         item_id: nil,
         status: "paused",
@@ -69,10 +130,116 @@ defmodule QueueParty.Rooms do
       }
     }
 
+    room = schedule_empty_cleanup(room)
     {:reply, {:ok, room}, Map.put(rooms, code, room)}
   end
 
   def handle_call({:get, code}, _from, rooms), do: {:reply, Map.get(rooms, code), rooms}
+
+  def handle_call({:join, code, guest_id, host_token, name}, {pid, _}, rooms)
+      when is_binary(guest_id) and byte_size(guest_id) > 0 do
+    case Map.get(rooms, code) do
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      room ->
+        cancel_empty_timer(room)
+        room = %{room | empty_timer: nil}
+
+        participant =
+          Map.get(room.participants, guest_id, %{
+            id: guest_id,
+            name: name,
+            order: room.join_sequence,
+            connections: %{}
+          })
+
+        participant =
+          if map_size(participant.connections) == 0,
+            do: %{participant | order: room.join_sequence},
+            else: participant
+
+        connections =
+          if Map.has_key?(participant.connections, pid),
+            do: participant.connections,
+            else: Map.put(participant.connections, pid, Process.monitor(pid))
+
+        room = %{
+          room
+          | participants:
+              Map.put(room.participants, guest_id, %{participant | connections: connections}),
+            join_sequence: room.join_sequence + 1
+        }
+
+        room =
+          cond do
+            host?(room, guest_id, host_token) ->
+              cancel_host_timer(room)
+              %{room | host_guest_id: guest_id, host_status: "online", host_timer: nil}
+
+            room.host_status == "waiting" ->
+              promote_host(room, guest_id)
+
+            true ->
+              room
+          end
+
+        save_room(room, rooms)
+    end
+  end
+
+  def handle_call({:rename_guest, code, guest_id, name}, _from, rooms) do
+    case Map.get(rooms, code) do
+      %{participants: %{^guest_id => participant}} = room ->
+        name = name |> String.trim() |> String.slice(0, 24)
+        name = if name == "", do: "Guest", else: name
+
+        room = %{
+          room
+          | participants: Map.put(room.participants, guest_id, %{participant | name: name})
+        }
+
+        save_room(room, rooms)
+
+      _ ->
+        {:reply, {:error, :not_found}, rooms}
+    end
+  end
+
+  def handle_call({:transfer_host, code, host_token, guest_id}, _from, rooms) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token} = room ->
+        if Enum.any?(connected_guests(room), &(&1.id == guest_id)),
+          do: save_room(promote_host(room, guest_id), rooms),
+          else: {:reply, {:error, :guest_unavailable}, rooms}
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:host_action, code, host_token, action}, from, rooms) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token} ->
+        command =
+          case action do
+            :skip -> {:skip, code}
+            {:finish, item_id} -> {:finish, code, item_id}
+            {:remove_item, item_id} -> {:remove_item, code, item_id}
+          end
+
+        handle_call(command, from, rooms)
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
 
   def handle_call({:add_item, code, youtube_id, submitted_by}, _from, rooms) do
     with %{items: items} = room <- Map.get(rooms, code) do
@@ -85,6 +252,7 @@ defmodule QueueParty.Rooms do
       }
 
       room = %{room | items: items ++ [item]}
+      room = if is_nil(room.now_playing), do: next_room(room), else: room
       rooms = Map.put(rooms, code, room)
       broadcast(code, {:room_updated, room})
       {:reply, {:ok, item}, rooms}
@@ -118,6 +286,50 @@ defmodule QueueParty.Rooms do
       room -> {:reply, {:ok, room}, rooms}
     end
   end
+
+  def handle_call({:request_skip, code, item_id, guest_id}, _from, rooms)
+      when is_binary(guest_id) and byte_size(guest_id) > 0 do
+    case Map.get(rooms, code) do
+      %{now_playing: %{id: ^item_id}} = room ->
+        room = %{room | skip_votes: MapSet.put(room.skip_votes, guest_id)}
+        maybe_skip(room, rooms)
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :stale_item}, rooms}
+    end
+  end
+
+  def handle_call({:request_skip, _, _, _}, _from, rooms),
+    do: {:reply, {:error, :invalid_guest}, rooms}
+
+  def handle_call({:approve_skip, code, host_token, item_id}, _from, rooms) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token, now_playing: %{id: ^item_id}} = room -> advance(room, rooms)
+      %{host_token: ^host_token} -> {:reply, {:error, :stale_item}, rooms}
+      nil -> {:reply, {:error, :not_found}, rooms}
+      _ -> {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:set_skip_threshold, code, host_token, threshold}, _from, rooms)
+      when is_integer(threshold) and threshold in 1..100 do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token} = room ->
+        maybe_skip(%{room | skip_threshold: threshold}, rooms)
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:set_skip_threshold, _, _, _}, _from, rooms),
+    do: {:reply, {:error, :invalid_threshold}, rooms}
 
   def handle_call({:set_playback_mode, code, host_token, mode}, _from, rooms)
       when mode in ["host_only", "everyone"] do
@@ -169,7 +381,111 @@ defmodule QueueParty.Rooms do
   def handle_call({:update_playback, _, _, _, _, _}, _from, rooms),
     do: {:reply, {:error, :invalid_playback}, rooms}
 
+  @impl true
+  def handle_info({:DOWN, ref, :process, pid, _reason}, rooms) do
+    rooms =
+      Map.new(rooms, fn {code, room} ->
+        case Enum.find(room.participants, fn {_id, participant} ->
+               Map.get(participant.connections, pid) == ref
+             end) do
+          nil ->
+            {code, room}
+
+          {guest_id, participant} ->
+            participant = %{participant | connections: Map.delete(participant.connections, pid)}
+            room = %{room | participants: Map.put(room.participants, guest_id, participant)}
+
+            room =
+              if guest_id == room.host_guest_id && map_size(participant.connections) == 0 do
+                marker = make_ref()
+
+                timer =
+                  Process.send_after(self(), {:host_grace_expired, code, marker}, @host_grace_ms)
+
+                %{room | host_status: "reconnecting", host_timer: {timer, marker}}
+              else
+                room
+              end
+
+            room = schedule_empty_cleanup(room)
+            broadcast(code, {:room_updated, room})
+            {code, room}
+        end
+      end)
+
+    {:noreply, rooms}
+  end
+
+  def handle_info({:host_grace_expired, code, marker}, rooms) do
+    case Map.get(rooms, code) do
+      %{host_timer: {_, ^marker}, host_status: "reconnecting"} = room ->
+        room =
+          case connected_guests(room) do
+            [next | _] -> promote_host(room, next.id)
+            [] -> %{room | host_status: "waiting", host_timer: nil}
+          end
+
+        broadcast(code, {:room_updated, room})
+        {:noreply, Map.put(rooms, code, room)}
+
+      _ ->
+        {:noreply, rooms}
+    end
+  end
+
+  def handle_info({:empty_room_expired, code, marker}, rooms) do
+    case Map.get(rooms, code) do
+      %{empty_timer: {_, ^marker}} = room ->
+        if empty_room?(room) do
+          cancel_empty_timer(room)
+          cancel_host_timer(room)
+          {:noreply, Map.delete(rooms, code)}
+        else
+          {:noreply, rooms}
+        end
+
+      _ ->
+        {:noreply, rooms}
+    end
+  end
+
+  defp empty_room?(room),
+    do:
+      Enum.all?(room.participants, fn {_id, participant} ->
+        map_size(participant.connections) == 0
+      end)
+
+  defp schedule_empty_cleanup(room) do
+    if is_nil(room.empty_timer) && empty_room?(room) do
+      marker = make_ref()
+      timer = Process.send_after(self(), {:empty_room_expired, room.code, marker}, @empty_room_ms)
+      %{room | empty_timer: {timer, marker}}
+    else
+      room
+    end
+  end
+
+  defp cancel_empty_timer(%{empty_timer: {timer, _}}), do: Process.cancel_timer(timer)
+  defp cancel_empty_timer(_room), do: :ok
+
+  defp cancel_host_timer(%{host_timer: {timer, _}}), do: Process.cancel_timer(timer)
+  defp cancel_host_timer(_room), do: :ok
+
+  defp promote_host(room, guest_id) do
+    cancel_host_timer(room)
+    %{room | host_guest_id: guest_id, host_token: token(), host_status: "online", host_timer: nil}
+  end
+
+  defp save_room(room, rooms) do
+    broadcast(room.code, {:room_updated, room})
+    {:reply, {:ok, room}, Map.put(rooms, room.code, room)}
+  end
+
   defp advance(room, rooms) do
+    room |> next_room() |> save_room(rooms)
+  end
+
+  defp next_room(room) do
     {next, rest} =
       case room.items do
         [item | rest] -> {item, rest}
@@ -184,9 +500,16 @@ defmodule QueueParty.Rooms do
       revision: room.playback.revision + 1
     }
 
-    room = %{room | items: rest, now_playing: next, playback: playback}
-    broadcast(room.code, {:room_updated, room})
-    {:reply, {:ok, room}, Map.put(rooms, room.code, room)}
+    %{room | items: rest, now_playing: next, playback: playback, skip_votes: MapSet.new()}
+  end
+
+  defp maybe_skip(room, rooms) do
+    if room.now_playing && MapSet.size(room.skip_votes) >= room.skip_threshold do
+      advance(room, rooms)
+    else
+      broadcast(room.code, {:room_updated, room})
+      {:reply, {:ok, room}, Map.put(rooms, room.code, room)}
+    end
   end
 
   defp broadcast(code, message),

@@ -4,22 +4,34 @@ defmodule QueuePartyWeb.RoomLive do
   alias QueueParty.{Rooms, YouTube}
 
   @impl true
-  def mount(%{"code" => code} = params, _session, socket) do
+  def mount(%{"code" => code} = params, session, socket) do
     code = String.upcase(code)
-    if connected?(socket), do: Rooms.subscribe(code)
+    name = "Guest #{Enum.random(100..999)}"
 
-    case Rooms.get_room(code) do
-      nil ->
+    result =
+      if connected?(socket) do
+        Rooms.subscribe(code)
+        Rooms.join_room(code, session["guest_id"], params["host"], name)
+      else
+        case Rooms.get_room(code) do
+          nil -> {:error, :not_found}
+          room -> {:ok, room}
+        end
+      end
+
+    case result do
+      {:error, :not_found} ->
         {:ok, socket |> put_flash(:error, "That room no longer exists.") |> redirect(to: ~p"/")}
 
-      room ->
+      {:ok, room} ->
         {:ok,
          socket
          |> assign(:code, code)
          |> assign(:host?, params["host"] == room.host_token)
          |> assign(:host_token, params["host"])
+         |> assign(:guest_id, session["guest_id"])
          |> assign(:video_form, to_form(%{"url" => ""}))
-         |> assign(:name_form, to_form(%{"name" => "Guest #{Enum.random(100..999)}"}))
+         |> assign(:name_form, to_form(%{"name" => name}))
          |> assign(:error, nil)
          |> assign_room(room)}
     end
@@ -54,21 +66,81 @@ defmodule QueuePartyWeb.RoomLive do
   def handle_event("set_name", %{"name" => name}, socket) do
     name = name |> String.trim() |> String.slice(0, 24)
     name = if name == "", do: "Guest", else: name
+    Rooms.rename_guest(socket.assigns.code, socket.assigns.guest_id, name)
     {:noreply, assign(socket, :name_form, to_form(%{"name" => name}))}
   end
 
+  def handle_event("transfer_host", %{"guest_id" => guest_id}, socket) do
+    result = Rooms.transfer_host(socket.assigns.code, socket.assigns.host_token, guest_id)
+
+    socket =
+      case result do
+        {:ok, room} ->
+          assign_room(socket, room)
+
+        _ ->
+          put_flash(
+            socket,
+            :error,
+            "That guest is no longer available. Choose a connected guest."
+          )
+      end
+
+    {:noreply, socket}
+  end
+
   def handle_event("remove", %{"id" => id}, socket) do
-    if socket.assigns.host?, do: Rooms.remove_item(socket.assigns.code, id)
+    if socket.assigns.host?,
+      do: Rooms.remove_item(socket.assigns.code, id, socket.assigns.host_token)
+
     {:noreply, socket}
   end
 
   def handle_event("skip", _params, socket) do
-    if socket.assigns.host?, do: Rooms.skip(socket.assigns.code)
+    if socket.assigns.host?, do: Rooms.skip(socket.assigns.code, socket.assigns.host_token)
     {:noreply, assign(socket, :error, nil)}
   end
 
+  def handle_event("request_skip", %{"item_id" => item_id}, socket) do
+    unless socket.assigns.host? do
+      Rooms.request_skip(socket.assigns.code, item_id, socket.assigns.guest_id)
+    end
+
+    {:noreply, socket}
+  end
+
+  def handle_event("approve_skip", %{"item_id" => item_id}, socket) do
+    if socket.assigns.host? do
+      Rooms.approve_skip(socket.assigns.code, socket.assigns.host_token, item_id)
+    end
+
+    {:noreply, socket}
+  end
+
+  def handle_event("set_skip_threshold", %{"skip_threshold" => value}, socket) do
+    result =
+      with true <- socket.assigns.host?,
+           true <- is_binary(value),
+           {threshold, ""} <- Integer.parse(value),
+           {:ok, _room} <-
+             Rooms.set_skip_threshold(socket.assigns.code, socket.assigns.host_token, threshold) do
+        :ok
+      else
+        _ -> :error
+      end
+
+    socket =
+      if result == :error && socket.assigns.host?,
+        do: put_flash(socket, :error, "Choose a whole number from 1 to 100."),
+        else: socket
+
+    {:noreply, socket}
+  end
+
   def handle_event("video_ended", %{"item_id" => item_id}, socket) do
-    if socket.assigns.host?, do: Rooms.finish(socket.assigns.code, item_id)
+    if socket.assigns.host?,
+      do: Rooms.finish(socket.assigns.code, item_id, socket.assigns.host_token)
+
     {:noreply, socket}
   end
 
@@ -128,9 +200,31 @@ defmodule QueuePartyWeb.RoomLive do
       Enum.with_index(room.items, 1)
       |> Enum.map(fn {item, position} -> Map.put(item, :position, position) end)
 
+    host? = Rooms.host?(room, socket.assigns.guest_id, socket.assigns.host_token)
+    candidates = Rooms.connected_guests(room)
+    participant = Map.get(room.participants, socket.assigns.guest_id)
+    host = Map.get(room.participants, room.host_guest_id)
+
     socket
+    |> assign(:host?, host?)
+    |> assign(:host_token, if(host?, do: room.host_token))
+    |> assign(:host_status, room.host_status)
+    |> assign(:host_name, if(host, do: host.name, else: "Host"))
+    |> assign(
+      :transfer_options,
+      Enum.map(candidates, &{"#{&1.name} · guest #{&1.order + 1}", &1.id})
+    )
+    |> assign(:transfer_form, to_form(%{"guest_id" => ""}))
+    |> assign(
+      :name_form,
+      if(participant, do: to_form(%{"name" => participant.name}), else: socket.assigns.name_form)
+    )
     |> assign(:now_playing, room.now_playing)
     |> assign(:playback_mode, room.playback_mode)
+    |> assign(:skip_threshold, room.skip_threshold)
+    |> assign(:skip_vote_count, MapSet.size(room.skip_votes))
+    |> assign(:skip_voted?, MapSet.member?(room.skip_votes, socket.assigns.guest_id))
+    |> assign(:skip_form, to_form(%{"skip_threshold" => to_string(room.skip_threshold)}))
     |> assign(:playback, Rooms.playback_snapshot(room))
     |> assign(:settings_form, to_form(%{"playback_mode" => room.playback_mode}))
     |> assign(:queue_count, length(items))
@@ -155,6 +249,17 @@ defmodule QueuePartyWeb.RoomLive do
           </div>
         </header>
 
+        <div id="host-status" class="host-status" role="status" data-status={@host_status}>
+          <%= case @host_status do %>
+            <% "reconnecting" -> %>
+              Host disconnected. Waiting up to 30 seconds for them to reconnect before passing control to the longest-connected guest.
+            <% "waiting" -> %>
+              Waiting for a host. The previous host can reconnect, or the next guest to join will take over.
+            <% _ -> %>
+              {if @host?, do: "You’re the host", else: "Host: #{@host_name}"}
+          <% end %>
+        </div>
+
         <section :if={@host?} id="room-settings" class="room-settings" aria-label="Room settings">
           <div>
             <div class="eyebrow">ROOM SETTINGS</div>
@@ -174,6 +279,43 @@ defmodule QueuePartyWeb.RoomLive do
               class="playback-select"
               options={[{"Host device only", "host_only"}, {"Every device", "everyone"}]}
             />
+          </.form>
+          <.form for={@skip_form} id="skip-settings" phx-submit="set_skip_threshold">
+            <.input
+              field={@skip_form[:skip_threshold]}
+              id="skip-threshold"
+              type="number"
+              label="Votes needed to skip"
+              min="1"
+              max="100"
+              step="1"
+              required
+              class="playback-select"
+            />
+            <button id="save-skip-threshold" type="submit" class="settings-save">Save</button>
+            <p>Default: 3 votes. Lowering the limit can skip the current song immediately.</p>
+          </.form>
+          <.form for={@transfer_form} id="transfer-host-form" phx-submit="transfer_host">
+            <.input
+              field={@transfer_form[:guest_id]}
+              id="transfer-host-guest"
+              type="select"
+              label="Transfer host"
+              prompt="Choose a connected guest"
+              options={@transfer_options}
+              required
+              class="playback-select"
+            />
+            <button
+              id="transfer-host"
+              type="submit"
+              class="settings-save"
+              disabled={@transfer_options == []}
+              data-confirm="Transfer host controls? You will become a guest."
+            >
+              Pass host controls
+            </button>
+            <p>Your queue and settings stay the same. The new host keeps control when you return.</p>
           </.form>
         </section>
 
@@ -225,18 +367,48 @@ defmodule QueuePartyWeb.RoomLive do
             <div :if={!@now_playing} class="empty-player">
               <div class="play-orb" aria-hidden="true">▶</div>
               <h1>Drop a song into the room</h1>
-              <p>The host starts playback once a video is queued.</p>
+              <p>
+                Add a video and playback starts automatically. Your browser may ask you to tap Play.
+              </p>
             </div>
             <div :if={@now_playing} id="now-playing" class="player-meta">
               <div><span class="live-dot"></span>Added by {@now_playing.submitted_by}</div>
               <button :if={@host?} id="skip-video" phx-click="skip" class="text-button">Skip to next →</button>
             </div>
-            <button
-              :if={@host? && !@now_playing && @queue_count > 0}
-              id="play-first"
-              phx-click="skip"
-              class="play-first"
-            >Play first video →</button>
+            <section
+              :if={@now_playing}
+              id="skip-requests"
+              class="skip-requests"
+              aria-label="Skip requests"
+            >
+              <p id="skip-vote-count" role="status">
+                Skip requests: {@skip_vote_count} / {@skip_threshold}
+              </p>
+              <button
+                :if={!@host?}
+                id="request-skip"
+                type="button"
+                phx-click="request_skip"
+                phx-value-item_id={@now_playing.id}
+                disabled={@skip_voted?}
+                class="play-first"
+              >
+                {if @skip_voted?, do: "Skip requested", else: "Request skip"}
+              </button>
+              <button
+                :if={@host? && @skip_vote_count > 0}
+                id="approve-skip"
+                type="button"
+                phx-click="approve_skip"
+                phx-value-item_id={@now_playing.id}
+                class="play-first"
+              >
+                Approve skip
+              </button>
+              <p class="skip-hint">
+                The host can approve early. At {@skip_threshold} votes, the song skips automatically.
+              </p>
+            </section>
           </section>
 
           <aside class="queue-panel">

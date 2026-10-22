@@ -2,6 +2,28 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import hook from "../../assets/js/youtube_player.mjs"
 
+test("host handoff changes reporting authority without restarting the song", async t => {
+  const {player, states, sent, update, tick, calls} = await mount(t, {host: false, position: 42})
+  player.emit(states.PLAYING)
+  update({host: "true", playbackPosition: "42"})
+  assert.equal(calls.filter(([name]) => name === "load").length, 1)
+  assert.deepEqual(sent.at(-1), ["playback_update", {item_id: "first-item", status: "playing", position: 42}])
+  update({host: "false", playbackPosition: "43"})
+  const count = sent.length
+  tick()
+  player.emit(states.ENDED)
+  assert.equal(sent.length, count, "former host must stop reporting and advancing the queue")
+})
+
+test("a guest promoted after the song ended can advance it", async t => {
+  const {player, states, sent, update} = await mount(t, {host: false})
+  player.emit(states.PLAYING)
+  player.emit(states.ENDED)
+  assert.equal(sent.length, 0)
+  update({host: "true"})
+  assert.deepEqual(sent.at(-1), ["video_ended", {item_id: "first-item"}])
+})
+
 async function mount(t, {host = true, position = 0, status = "playing", destroyBeforeAPI = false} = {}) {
   let clock = 0
   let tick
