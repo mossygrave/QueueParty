@@ -30,7 +30,10 @@ mix setup
 3. Find the computer's local IP in macOS System Settings → Wi-Fi → Details → TCP/IP.
 4. Open `http://COMPUTER-IP:4000` on the host and guest devices. A phone's `localhost` points to the phone, not the computer.
 5. Start a room on the device that will play the videos. Guests join using its five-character room code or the **Copy invite** link.
-6. Add YouTube links. The host clicks **Play first video**. Playback then advances when each video ends; guests see the queue and current-video thumbnail.
+6. Add YouTube links. The host clicks **Play first video**. Playback then advances when each video ends.
+7. In **Room settings → Play music on**, the host can choose **Host device only** (the default) or **Every device**. The setting changes live for everyone in the room.
+
+With **Every device**, guests get their own YouTube player following the host's current song, play/pause state, and playhead. Late joiners start near the current position. If a browser blocks audio, tap **Play on this device** or the YouTube play button. The host alone advances the queue; guests control their own volume. Switching back to **Host device only** stops the guest players.
 
 The development server is configured to accept connections on the local network. If a phone cannot connect, check the Mac firewall and whether the Wi-Fi network isolates devices. Keep the host page open during playback.
 
@@ -67,7 +70,7 @@ node --test test/js/youtube_player_test.mjs
 ## Current limits
 
 - Rooms and queues are kept in memory and are cleared on server restart. This MVP runs on one server instance.
-- Only the host plays audio/video. Guests submit links and follow the queue; synchronized playback on every phone is not implemented.
+- Every-device playback uses periodic playhead corrections, so synchronization is approximate. YouTube ads, buffering, network delays, and browser background restrictions can cause devices to differ. Keep the host page open to control playback and advance the queue.
 - Browsers may require a click on the YouTube Play button before allowing sound. Some videos cannot be embedded; the host can skip them.
 - Queue titles show the video ID; title lookup, QR codes, accounts, and moderation are future features.
 - Public deployment needs production secrets, HTTPS, and a hosting setup. These local development instructions do not deploy the app.

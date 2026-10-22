@@ -67,4 +67,87 @@ defmodule QueuePartyWeb.RoomLiveTest do
     assert has_element?(guest, "#room-error")
     assert has_element?(guest, "#queue-empty")
   end
+
+  test "only the host can change listening mode, including during playback", %{conn: conn} do
+    {:ok, room} = Rooms.create_room()
+    {:ok, item} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
+    Rooms.skip(room.code)
+    {:ok, host, _} = live(conn, ~p"/room/#{room.code}?host=#{room.host_token}")
+    {:ok, guest, _} = live(build_conn(), ~p"/room/#{room.code}")
+
+    assert has_element?(host, "#playback-settings")
+    refute has_element?(guest, "#playback-settings")
+    refute has_element?(guest, "#youtube-player")
+    render_hook(guest, "set_playback_mode", %{"playback_mode" => "everyone"})
+    assert Rooms.get_room(room.code).playback_mode == "host_only"
+
+    host |> form("#playback-settings", playback_mode: "everyone") |> render_change()
+    assert has_element?(guest, "#youtube-player[data-host='false']")
+    assert has_element?(guest, "#enable-device-audio")
+    assert has_element?(guest, "#playback-mode-label", "every device")
+    assert Rooms.get_room(room.code).now_playing.id == item.id
+
+    host |> form("#playback-settings", playback_mode: "host_only") |> render_change()
+    refute has_element?(guest, "#youtube-player")
+    refute has_element?(guest, "#enable-device-audio")
+    assert has_element?(host, "#youtube-player")
+    assert Rooms.get_room(room.code).now_playing.id == item.id
+  end
+
+  test "everyone mode follows host playhead and ignores guest playback reports", %{conn: conn} do
+    {:ok, room} = Rooms.create_room()
+    {:ok, item} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
+    item_id = item.id
+    Rooms.skip(room.code)
+    Rooms.set_playback_mode(room.code, room.host_token, "everyone")
+    {:ok, host, _} = live(conn, ~p"/room/#{room.code}?host=#{room.host_token}")
+    {:ok, guest, _} = live(build_conn(), ~p"/room/#{room.code}")
+
+    render_hook(host, "playback_update", %{item_id: item.id, status: "paused", position: 42.5})
+    render(guest)
+
+    assert_push_event(guest, "room_playback", %{
+      item_id: ^item_id,
+      status: "paused",
+      position: 42.5,
+      revision: 2
+    })
+
+    render_hook(guest, "playback_update", %{item_id: item.id, status: "playing", position: 0})
+    render_hook(guest, "video_ended", %{item_id: item.id})
+    assert %{status: "paused", position: 42.5} = Rooms.get_room(room.code).playback
+    assert Rooms.get_room(room.code).now_playing.id == item.id
+
+    {:ok, late_guest, _} = live(build_conn(), ~p"/room/#{room.code}")
+
+    assert has_element?(
+             late_guest,
+             "#youtube-player[data-playback-status='paused'][data-playback-position='42.5']"
+           )
+
+    render_hook(host, "playback_update", %{item_id: item.id, status: "playing", position: 44})
+    render(guest)
+
+    assert_push_event(guest, "room_playback", %{item_id: ^item_id, status: "playing", revision: 3})
+  end
+
+  test "everyone mode keeps next-track advancement under host control", %{conn: conn} do
+    {:ok, room} = Rooms.create_room()
+    {:ok, first} = Rooms.add_item(room.code, "dQw4w9WgXcQ", "A")
+    {:ok, second} = Rooms.add_item(room.code, "M7lc1UVf-VE", "B")
+    Rooms.set_playback_mode(room.code, room.host_token, "everyone")
+    Rooms.skip(room.code)
+    {:ok, host, _} = live(conn, ~p"/room/#{room.code}?host=#{room.host_token}")
+    {:ok, guest, _} = live(build_conn(), ~p"/room/#{room.code}")
+
+    render_hook(guest, "video_ended", %{item_id: first.id})
+    assert Rooms.get_room(room.code).now_playing.id == first.id
+    render_hook(host, "video_ended", %{item_id: first.id})
+    assert has_element?(guest, "#youtube-player[data-item-id='#{second.id}']")
+    assert Rooms.get_room(room.code).playback.position == 0.0
+
+    render_hook(host, "playback_update", %{item_id: first.id, status: "playing", position: 300})
+    assert Rooms.get_room(room.code).playback.item_id == second.id
+    assert Rooms.get_room(room.code).playback.position == 0.0
+  end
 end

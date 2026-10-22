@@ -24,13 +24,51 @@ defmodule QueueParty.Rooms do
   def finish(code, item_id),
     do: GenServer.call(__MODULE__, {:finish, String.upcase(code), item_id})
 
+  def set_playback_mode(code, host_token, mode),
+    do: GenServer.call(__MODULE__, {:set_playback_mode, String.upcase(code), host_token, mode})
+
+  def update_playback(code, host_token, item_id, status, position) do
+    GenServer.call(
+      __MODULE__,
+      {:update_playback, String.upcase(code), host_token, item_id, status, position}
+    )
+  end
+
+  @doc "Returns the current playhead without exposing a server-specific clock to browsers."
+  def playback_snapshot(%{playback: playback}) do
+    elapsed =
+      if playback.status == "playing", do: (now_ms() - playback.updated_at) / 1000, else: 0
+
+    %{
+      item_id: playback.item_id,
+      status: playback.status,
+      position: playback.position + elapsed,
+      revision: playback.revision
+    }
+  end
+
   @impl true
   def init(rooms), do: {:ok, rooms}
 
   @impl true
   def handle_call(:create, _from, rooms) do
     code = unique_code(rooms)
-    room = %{code: code, host_token: token(), items: [], now_playing: nil}
+
+    room = %{
+      code: code,
+      host_token: token(),
+      items: [],
+      now_playing: nil,
+      playback_mode: "host_only",
+      playback: %{
+        item_id: nil,
+        status: "paused",
+        position: 0.0,
+        updated_at: now_ms(),
+        revision: 0
+      }
+    }
+
     {:reply, {:ok, room}, Map.put(rooms, code, room)}
   end
 
@@ -81,6 +119,56 @@ defmodule QueueParty.Rooms do
     end
   end
 
+  def handle_call({:set_playback_mode, code, host_token, mode}, _from, rooms)
+      when mode in ["host_only", "everyone"] do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token} = room ->
+        room = %{room | playback_mode: mode}
+        broadcast(code, {:room_updated, room})
+        {:reply, {:ok, room}, Map.put(rooms, code, room)}
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:set_playback_mode, _, _, _}, _from, rooms),
+    do: {:reply, {:error, :invalid_mode}, rooms}
+
+  def handle_call({:update_playback, code, host_token, item_id, status, position}, _from, rooms)
+      when status in ["playing", "paused", "buffering"] and is_number(position) and
+             position >= 0 and position <= 604_800 do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token, now_playing: %{id: ^item_id}} = room ->
+        playback = %{
+          item_id: item_id,
+          status: status,
+          position: position,
+          updated_at: now_ms(),
+          revision: room.playback.revision + 1
+        }
+
+        room = %{room | playback: playback}
+        broadcast(code, {:playback_updated, playback_snapshot(room)})
+        {:reply, :ok, Map.put(rooms, code, room)}
+
+      %{host_token: ^host_token} ->
+        {:reply, {:error, :stale_item}, rooms}
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:update_playback, _, _, _, _, _}, _from, rooms),
+    do: {:reply, {:error, :invalid_playback}, rooms}
+
   defp advance(room, rooms) do
     {next, rest} =
       case room.items do
@@ -88,7 +176,15 @@ defmodule QueueParty.Rooms do
         [] -> {nil, []}
       end
 
-    room = %{room | items: rest, now_playing: next}
+    playback = %{
+      item_id: next && next.id,
+      status: if(next, do: "playing", else: "paused"),
+      position: 0.0,
+      updated_at: now_ms(),
+      revision: room.playback.revision + 1
+    }
+
+    room = %{room | items: rest, now_playing: next, playback: playback}
     broadcast(room.code, {:room_updated, room})
     {:reply, {:ok, room}, Map.put(rooms, room.code, room)}
   end
@@ -98,6 +194,7 @@ defmodule QueueParty.Rooms do
 
   defp topic(code), do: @topic_prefix <> String.upcase(code)
   defp token, do: :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+  defp now_ms, do: System.monotonic_time(:millisecond)
 
   defp unique_code(rooms) do
     code = :crypto.strong_rand_bytes(3) |> Base.encode32(case: :upper, padding: false)

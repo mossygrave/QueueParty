@@ -17,6 +17,7 @@ defmodule QueuePartyWeb.RoomLive do
          socket
          |> assign(:code, code)
          |> assign(:host?, params["host"] == room.host_token)
+         |> assign(:host_token, params["host"])
          |> assign(:video_form, to_form(%{"url" => ""}))
          |> assign(:name_form, to_form(%{"name" => "Guest #{Enum.random(100..999)}"}))
          |> assign(:error, nil)
@@ -71,6 +72,37 @@ defmodule QueuePartyWeb.RoomLive do
     {:noreply, socket}
   end
 
+  def handle_event("set_playback_mode", %{"playback_mode" => mode}, socket) do
+    if socket.assigns.host? do
+      Rooms.set_playback_mode(socket.assigns.code, socket.assigns.host_token, mode)
+    end
+
+    {:noreply, socket}
+  end
+
+  def handle_event(
+        "playback_update",
+        %{"item_id" => item_id, "status" => status, "position" => position},
+        socket
+      ) do
+    if socket.assigns.host? do
+      Rooms.update_playback(
+        socket.assigns.code,
+        socket.assigns.host_token,
+        item_id,
+        status,
+        position
+      )
+    end
+
+    {:noreply, socket}
+  end
+
+  def handle_event("request_playback", _params, socket) do
+    room = Rooms.get_room(socket.assigns.code)
+    {:reply, %{playback: room && Rooms.playback_snapshot(room)}, socket}
+  end
+
   def handle_event("player_error", _params, socket) do
     {:noreply,
      assign(
@@ -88,6 +120,9 @@ defmodule QueuePartyWeb.RoomLive do
   @impl true
   def handle_info({:room_updated, room}, socket), do: {:noreply, assign_room(socket, room)}
 
+  def handle_info({:playback_updated, playback}, socket),
+    do: {:noreply, push_event(socket, "room_playback", playback)}
+
   defp assign_room(socket, room) do
     items =
       Enum.with_index(room.items, 1)
@@ -95,6 +130,9 @@ defmodule QueuePartyWeb.RoomLive do
 
     socket
     |> assign(:now_playing, room.now_playing)
+    |> assign(:playback_mode, room.playback_mode)
+    |> assign(:playback, Rooms.playback_snapshot(room))
+    |> assign(:settings_form, to_form(%{"playback_mode" => room.playback_mode}))
     |> assign(:queue_count, length(items))
     |> stream(:items, items, reset: true)
   end
@@ -117,25 +155,72 @@ defmodule QueuePartyWeb.RoomLive do
           </div>
         </header>
 
+        <section :if={@host?} id="room-settings" class="room-settings" aria-label="Room settings">
+          <div>
+            <div class="eyebrow">ROOM SETTINGS</div>
+            <p>Choose where everyone listens. You stay in control of playback.</p>
+          </div>
+          <.form
+            for={@settings_form}
+            id="playback-settings"
+            phx-change="set_playback_mode"
+            phx-submit="set_playback_mode"
+          >
+            <.input
+              field={@settings_form[:playback_mode]}
+              id="playback-mode"
+              type="select"
+              label="Play music on"
+              class="playback-select"
+              options={[{"Host device only", "host_only"}, {"Every device", "everyone"}]}
+            />
+          </.form>
+        </section>
+
         <main class="room-layout">
           <section class="player-panel">
             <div class="eyebrow">NOW PLAYING · {if @host?, do: "HOST", else: "GUEST"}</div>
+            <p id="playback-mode-label" class="playback-mode-label">
+              {if @playback_mode == "everyone",
+                do: "Listening on every device",
+                else: "Listening on the host’s device"}
+            </p>
             <div
-              :if={@host? && @now_playing}
+              :if={@now_playing && (@host? || @playback_mode == "everyone")}
               id="youtube-player"
               class="player-frame"
               phx-hook="YouTubePlayer"
               phx-update="ignore"
               data-video-id={@now_playing.youtube_id}
               data-item-id={@now_playing.id}
+              data-host={to_string(@host?)}
+              data-playback-status={@playback.status}
+              data-playback-position={@playback.position}
+              data-playback-revision={@playback.revision}
             >
             </div>
-            <div :if={!@host? && @now_playing} class="guest-playing">
+            <div :if={!@host? && @now_playing && @playback_mode == "host_only"} class="guest-playing">
               <img
                 src={"https://img.youtube.com/vi/#{@now_playing.youtube_id}/hqdefault.jpg"}
                 alt="Current video thumbnail"
               />
               <p>Playing on the host’s device</p>
+            </div>
+            <div
+              :if={!@host? && @now_playing && @playback_mode == "everyone"}
+              id="device-playback"
+              class="device-playback"
+            >
+              <button
+                id="enable-device-audio"
+                type="button"
+                phx-click={JS.dispatch("queueparty:enable-audio", to: "#youtube-player")}
+                class="play-first"
+                aria-describedby="device-playback-hint"
+              >Play on this device</button>
+              <p id="device-playback-hint">
+                If you don’t hear audio, tap Play here or in the YouTube player. The host controls the song; your volume is local.
+              </p>
             </div>
             <div :if={!@now_playing} class="empty-player">
               <div class="play-orb" aria-hidden="true">▶</div>
