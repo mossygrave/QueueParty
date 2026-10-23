@@ -1,5 +1,5 @@
 defmodule QueueParty.YouTube do
-  @moduledoc "Validates YouTube links and extracts their video IDs."
+  @moduledoc "Validates YouTube links and retrieves public video titles."
 
   @hosts ~w(youtube.com www.youtube.com m.youtube.com music.youtube.com youtube-nocookie.com www.youtube-nocookie.com)
 
@@ -28,6 +28,43 @@ defmodule QueueParty.YouTube do
   end
 
   def video_id(_), do: :error
+
+  @doc "Fetches a public title using YouTube oEmbed, without a YouTube API key."
+  def fetch_title(id, options \\ []) do
+    if is_binary(id) && Regex.match?(~r/\A[A-Za-z0-9_-]{11}\z/, id) do
+      request_options =
+        [
+          url: "https://www.youtube.com/oembed",
+          params: [url: "https://www.youtube.com/watch?v=#{id}", format: "json"],
+          headers: [accept: "application/json"],
+          receive_timeout: 3_000,
+          finch: [conn_opts: [timeout: 2_000], pool_timeout: 2_000],
+          request_timeout: 5_000,
+          retry: false,
+          redirect: false
+        ]
+        |> Keyword.merge(Application.get_env(:queue_party, :youtube_request_options, []))
+        |> Keyword.merge(options)
+
+      case Req.get(request_options) do
+        {:ok, %{status: 200, body: %{"title" => title}}} when is_binary(title) ->
+          normalize_title(title)
+
+        _ ->
+          :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp normalize_title(title) do
+    if String.valid?(title) && String.trim(title) != "" do
+      {:ok, title |> String.trim() |> String.slice(0, 500)}
+    else
+      :error
+    end
+  end
 
   defp with_scheme(url) do
     if String.contains?(url, "://"), do: url, else: "https://" <> url

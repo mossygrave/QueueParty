@@ -148,11 +148,13 @@ export default {
               this.pushEvent("video_ended", {item_id: this.playingItemId})
             }
           },
-          onError: () => {
+          onError: event => {
             if (this.disposed) return
+            const actualVideo = this.player.getVideoData().video_id
+            if (actualVideo && actualVideo !== this.el.dataset.videoId) return
             this.loadingItem = false
             this.reportHost("paused")
-            this.pushEvent("player_error", {})
+            this.pushEvent("player_error", {item_id: this.activeItemId, code: event.data})
           },
           onAutoplayBlocked: () => {
             if (this.disposed) return

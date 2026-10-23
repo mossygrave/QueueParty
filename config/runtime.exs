@@ -1,5 +1,9 @@
 import Config
 
+if config_env() != :test do
+  config :queue_party, :youtube_api_key, System.get_env("YOUTUBE_API_KEY")
+end
+
 # config/runtime.exs is executed for all environments, including
 # during releases. It is executed after compilation and before the
 # system starts, so it is typically used to load production configuration

@@ -12,6 +12,7 @@ defmodule QueueParty.Application do
       {DNSCluster, query: Application.get_env(:queue_party, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: QueueParty.PubSub},
       QueueParty.Rooms,
+      {Task.Supervisor, name: QueueParty.TitleTasks, max_children: 32},
       # Start a worker by calling: QueueParty.Worker.start_link(arg)
       # {QueueParty.Worker, arg},
       # Start to serve requests, typically the last entry

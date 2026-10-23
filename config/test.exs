@@ -1,5 +1,10 @@
 import Config
 
+# Keep metadata lookups deterministic and offline during the test suite.
+config :queue_party, :youtube_request_options, plug: QueueParty.YouTubeStub
+config :queue_party, :youtube_api_key, "test-api-key"
+config :queue_party, :youtube_playlist_request_options, plug: QueueParty.YouTubePlaylistStub
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :queue_party, QueuePartyWeb.Endpoint,

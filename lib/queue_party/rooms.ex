@@ -36,8 +36,49 @@ defmodule QueueParty.Rooms do
   end
 
   def add_item(code, youtube_id, submitted_by) do
-    GenServer.call(__MODULE__, {:add_item, String.upcase(code), youtube_id, submitted_by})
+    result =
+      GenServer.call(__MODULE__, {:add_item, String.upcase(code), youtube_id, submitted_by})
+
+    case result do
+      {:ok, item} ->
+        # Keep HTTP requests outside the room server so playback never waits on metadata.
+        Task.Supervisor.start_child(QueueParty.TitleTasks, fn ->
+          case QueueParty.YouTube.fetch_title(youtube_id) do
+            {:ok, title} -> set_item_title(code, item.id, title)
+            :error -> :ok
+          end
+        end)
+
+      _ ->
+        :ok
+    end
+
+    result
   end
+
+  @doc false
+  def set_item_title(code, item_id, title),
+    do: GenServer.call(__MODULE__, {:set_item_title, String.upcase(code), item_id, title})
+
+  def begin_playlist_import(code, host_token),
+    do: GenServer.call(__MODULE__, {:begin_playlist_import, String.upcase(code), host_token})
+
+  def complete_playlist_import(code, host_token, marker, playlist),
+    do:
+      GenServer.call(
+        __MODULE__,
+        {:complete_playlist_import, String.upcase(code), host_token, marker, playlist}
+      )
+
+  def remove_playlist(code, host_token),
+    do: GenServer.call(__MODULE__, {:remove_playlist, String.upcase(code), host_token})
+
+  def set_playlist_repeat(code, host_token, repeat?),
+    do: GenServer.call(__MODULE__, {:playlist_repeat, String.upcase(code), host_token, repeat?})
+
+  def fail_playlist_item(code, host_token, item_id),
+    do:
+      GenServer.call(__MODULE__, {:fail_playlist_item, String.upcase(code), host_token, item_id})
 
   def remove_item(code, item_id),
     do: GenServer.call(__MODULE__, {:remove_item, String.upcase(code), item_id})
@@ -117,6 +158,8 @@ defmodule QueueParty.Rooms do
       participants: %{},
       join_sequence: 0,
       items: [],
+      playlist: nil,
+      playlist_import: nil,
       now_playing: nil,
       playback_mode: "host_only",
       skip_threshold: 3,
@@ -271,6 +314,130 @@ defmodule QueueParty.Rooms do
       nil -> {:reply, {:error, :not_found}, rooms}
     end
   end
+
+  def handle_call({:set_item_title, code, item_id, title}, _from, rooms)
+      when is_binary(title) and byte_size(title) in 1..2_000 do
+    case Map.get(rooms, code) do
+      %{now_playing: %{id: ^item_id} = current} = room ->
+        save_room(%{room | now_playing: %{current | title: title}}, rooms)
+
+      %{items: items} = room ->
+        if Enum.any?(items, &(&1.id == item_id)) do
+          items =
+            Enum.map(items, fn item ->
+              if item.id == item_id, do: %{item | title: title}, else: item
+            end)
+
+          save_room(%{room | items: items}, rooms)
+        else
+          {:reply, :ignored, rooms}
+        end
+
+      _ ->
+        {:reply, :ignored, rooms}
+    end
+  end
+
+  def handle_call({:set_item_title, _, _, _}, _from, rooms), do: {:reply, :ignored, rooms}
+
+  def handle_call({:begin_playlist_import, code, host_token}, _from, rooms) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token} = room ->
+        marker = make_ref()
+        {:reply, {:ok, marker}, Map.put(rooms, code, %{room | playlist_import: marker})}
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:complete_playlist_import, code, host_token, marker, data}, _from, rooms) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token, playlist_import: ^marker} = room when not is_nil(marker) ->
+        if valid_playlist?(data) do
+          repeat? = room.playlist && room.playlist.repeat?
+          playlist = Map.merge(data, %{remaining: data.tracks, repeat?: repeat? == true})
+          room = %{room | playlist: playlist, playlist_import: nil}
+          room = if is_nil(room.now_playing), do: next_room(room), else: room
+          save_room(room, rooms)
+        else
+          {:reply, {:error, :invalid_playlist}, rooms}
+        end
+
+      %{host_token: ^host_token} ->
+        {:reply, {:error, :stale_import}, rooms}
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:remove_playlist, code, host_token}, _from, rooms) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token} = room ->
+        save_room(%{room | playlist: nil, playlist_import: nil}, rooms)
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:playlist_repeat, code, host_token, repeat?}, _from, rooms)
+      when is_boolean(repeat?) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token, playlist: playlist} = room when not is_nil(playlist) ->
+        room = %{room | playlist: %{playlist | repeat?: repeat?}}
+        room = if is_nil(room.now_playing), do: next_room(room), else: room
+        save_room(room, rooms)
+
+      %{host_token: ^host_token} ->
+        {:reply, {:error, :no_playlist}, rooms}
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:fail_playlist_item, code, host_token, item_id}, _from, rooms) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token, now_playing: %{id: ^item_id, source: :playlist} = item} = room ->
+        playlist =
+          if room.playlist do
+            %{
+              room.playlist
+              | tracks: Enum.reject(room.playlist.tracks, &(&1.youtube_id == item.youtube_id)),
+                remaining:
+                  Enum.reject(room.playlist.remaining, &(&1.youtube_id == item.youtube_id))
+            }
+          end
+
+        advance(%{room | playlist: playlist}, rooms)
+
+      %{host_token: ^host_token} ->
+        {:reply, :ignored, rooms}
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
+    end
+  end
+
+  def handle_call({:playlist_repeat, _, _, _}, _from, rooms),
+    do: {:reply, {:error, :invalid_repeat}, rooms}
 
   def handle_call({:skip, code}, _from, rooms) do
     case Map.get(rooms, code) do
@@ -486,10 +653,14 @@ defmodule QueueParty.Rooms do
   end
 
   defp next_room(room) do
-    {next, rest} =
+    {next, rest, playlist} =
       case room.items do
-        [item | rest] -> {item, rest}
-        [] -> {nil, []}
+        [item | rest] ->
+          {item, rest, room.playlist}
+
+        [] ->
+          {item, playlist} = next_playlist_item(room.playlist)
+          {item, [], playlist}
       end
 
     playback = %{
@@ -500,8 +671,54 @@ defmodule QueueParty.Rooms do
       revision: room.playback.revision + 1
     }
 
-    %{room | items: rest, now_playing: next, playback: playback, skip_votes: MapSet.new()}
+    %{
+      room
+      | items: rest,
+        playlist: playlist,
+        now_playing: next,
+        playback: playback,
+        skip_votes: MapSet.new()
+    }
   end
+
+  defp next_playlist_item(nil), do: {nil, nil}
+
+  defp next_playlist_item(playlist) do
+    available =
+      if playlist.remaining == [] && playlist.repeat?,
+        do: playlist.tracks,
+        else: playlist.remaining
+
+    case available do
+      [track | rest] ->
+        item =
+          Map.merge(track, %{
+            id: token(),
+            source: :playlist,
+            submitted_by: "Host playlist",
+            inserted_at: DateTime.utc_now()
+          })
+
+        {item, %{playlist | remaining: rest}}
+
+      [] ->
+        {nil, playlist}
+    end
+  end
+
+  defp valid_playlist?(%{id: id, title: title, url: url, tracks: tracks})
+       when is_binary(id) and is_binary(title) and is_binary(url) and is_list(tracks) do
+    length(tracks) in 1..200 &&
+      Enum.all?(tracks, fn
+        %{youtube_id: video_id, title: name} when is_binary(video_id) and is_binary(name) ->
+          Regex.match?(~r/\A[A-Za-z0-9_-]{11}\z/, video_id) && String.trim(name) != ""
+
+        _ ->
+          false
+      end)
+  end
+
+  defp valid_playlist?(_), do: false
 
   defp maybe_skip(room, rooms) do
     if room.now_playing && MapSet.size(room.skip_votes) >= room.skip_threshold do

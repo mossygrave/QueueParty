@@ -43,6 +43,32 @@ mix setup
 
 With **Every device**, guests get their own YouTube player following the host's current song, play/pause state, and playhead. Late joiners start near the current position. If a browser blocks audio, tap **Play on this device** or the YouTube play button. The host controls playback; guest skip requests can also advance the queue at the configured vote threshold. Guests control their own volume. Switching back to **Host device only** stops the guest players.
 
+Video titles are fetched in the background from YouTube's public oEmbed endpoint, without an API key. They appear in **Up next** and **Now playing** for everyone in the room. Playback starts immediately; a video-ID label is shown until its title arrives. If YouTube is unavailable, rate-limits the lookup, or cannot return metadata for a video, that fallback label stays and playback is unaffected. New submissions are looked up; existing items are not automatically backfilled after an upgrade.
+
+### Background playlists and Play next
+
+The host can use **Background playlist → Public YouTube playlist URL → Load / replace playlist** to import one public playlist, up to **200 entries**. Loading happens in the background, without stopping playback. Private/unlisted playlists and automatically generated YouTube Mix (`RD…`) links are not supported.
+
+- Individually submitted songs enter **Play next**, in submission order. The current song is never interrupted.
+- When a song ends or is skipped, Play next is checked first. When requests run out, the host playlist resumes at its next track.
+- A successful import starts automatically if the room is idle. Replacing a playlist leaves the current song and requests intact, and starts the replacement from its beginning on its next turn.
+- **Repeat playlist** is off by default. Enable it to restart the playlist after its last track, while continuing to prioritize requests. Enabling repeat on an exhausted playlist restarts it automatically if the room is idle.
+- **Remove playlist** cancels future playlist tracks (and any pending import); the current video finishes normally and individual requests remain.
+- Everyone sees the loaded title and a preview of up to 10 upcoming playlist tracks. Each import is a snapshot; load it again to pick up later edits on YouTube. Imports that fail leave the previous playlist unchanged.
+- Private/deleted entries are filtered during import. Playlist videos rejected by the host's player as unavailable or non-embeddable are skipped and excluded from later repeats in that room. If none remain, the playlist stops rather than looping through errors. Other player failures still allow the host to retry or skip manually.
+
+Playlist position, repeat settings, and requests survive a host handoff, but still follow the room's normal in-memory restart and expiration rules. Guest skip votes apply to playlist songs as well as individual requests.
+
+#### Optional YouTube Data API setup
+
+Individual links and public title lookups still work without an API key. **Playlist imports require one server-side YouTube Data API v3 key**:
+
+1. Create a Google Cloud project, enable **YouTube Data API v3**, and create an API key. Restrict the key to that API. See [Google's setup guide](https://developers.google.com/youtube/v3/getting-started).
+2. In Render, add **Environment → Environment Variables → `YOUTUBE_API_KEY`**, set its value privately, and redeploy. No secret file is needed.
+3. For local development, set `YOUTUBE_API_KEY` in the terminal environment before starting Phoenix. Never commit the actual key, paste it into a room, or put it in browser-side code.
+
+Imports fetch playlist metadata and then pages of up to 50 entries using Req. A 200-entry playlist normally needs five requests: one metadata request plus four item-page requests. Missing credentials, API restrictions/quota problems, timeouts, empty playlists, and size limits are explained in the host's import form. See [playlist metadata](https://developers.google.com/youtube/v3/docs/playlists/list) and [playlist items](https://developers.google.com/youtube/v3/docs/playlistItems/list).
+
 ### Guest skip requests
 
 While a song is playing, guests can select **Request skip**. Everyone sees the vote count, and the host can select **Approve skip** without waiting for the threshold. At the configured threshold, the song skips automatically—even if there are no more queued videos, in which case playback stops.
@@ -172,5 +198,5 @@ node --test test/js/youtube_player_test.mjs
 - Rooms and queues are kept in memory, deleted after 15 minutes with no connected participants, and cleared on server restart. This MVP runs on one server instance.
 - Every-device playback uses periodic playhead corrections, so synchronization is approximate. YouTube ads, buffering, network delays, and browser background restrictions can cause devices to differ. Keep the host page open to control playback and advance the queue.
 - Browsers may require a click on the YouTube Play button before allowing sound. Some videos cannot be embedded; the host can skip them.
-- Queue titles show the video ID; title lookup, QR codes, accounts, and moderation are future features.
+- Public video titles depend on YouTube metadata availability. QR codes, accounts, and moderation are future features.
 - The documented Render setup requires production environment variables and a successful live deployment. Changing local files alone does not update the hosted site.

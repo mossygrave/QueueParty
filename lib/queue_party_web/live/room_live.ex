@@ -2,6 +2,7 @@ defmodule QueuePartyWeb.RoomLive do
   use QueuePartyWeb, :live_view
 
   alias QueueParty.{Rooms, YouTube}
+  alias QueueParty.YouTubePlaylist
 
   @impl true
   def mount(%{"code" => code} = params, session, socket) do
@@ -33,11 +34,56 @@ defmodule QueuePartyWeb.RoomLive do
          |> assign(:video_form, to_form(%{"url" => ""}))
          |> assign(:name_form, to_form(%{"name" => name}))
          |> assign(:error, nil)
+         |> assign(:playlist_form, to_form(%{"url" => ""}))
+         |> assign(:playlist_job, nil)
+         |> assign(:playlist_error, nil)
+         |> assign(
+           :playlist_configured?,
+           is_binary(Application.get_env(:queue_party, :youtube_api_key)) &&
+             String.trim(Application.get_env(:queue_party, :youtube_api_key)) != ""
+         )
          |> assign_room(room)}
     end
   end
 
   @impl true
+  def handle_event("load_playlist", %{"url" => url}, socket) do
+    with true <- socket.assigns.host?,
+         {:ok, _id} <- YouTubePlaylist.playlist_id(url),
+         {:ok, marker} <-
+           Rooms.begin_playlist_import(socket.assigns.code, socket.assigns.host_token) do
+      job = {:playlist_import, marker, socket.assigns.host_token}
+
+      {:noreply,
+       socket
+       |> assign(playlist_job: job, playlist_error: nil, playlist_form: to_form(%{"url" => url}))
+       |> start_async(job, fn -> YouTubePlaylist.fetch(url) end)}
+    else
+      _ ->
+        {:noreply,
+         assign(
+           socket,
+           :playlist_error,
+           "Only the host can load a valid YouTube playlist URL. YouTube Mix links are not supported."
+         )}
+    end
+  end
+
+  def handle_event("remove_playlist", _params, socket) do
+    case Rooms.remove_playlist(socket.assigns.code, socket.assigns.host_token) do
+      {:ok, _} -> {:noreply, assign(socket, playlist_job: nil, playlist_error: nil)}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("playlist_repeat", %{"repeat" => repeat}, socket) do
+    if socket.assigns.host? && repeat in ["true", "false"] do
+      Rooms.set_playlist_repeat(socket.assigns.code, socket.assigns.host_token, repeat == "true")
+    end
+
+    {:noreply, socket}
+  end
+
   def handle_event("submit_video", %{"url" => url}, socket) do
     case YouTube.video_id(url) do
       {:ok, id} ->
@@ -175,6 +221,20 @@ defmodule QueuePartyWeb.RoomLive do
     {:reply, %{playback: room && Rooms.playback_snapshot(room)}, socket}
   end
 
+  def handle_event("player_error", %{"item_id" => item_id, "code" => code}, socket)
+      when code in [2, 100, 101, 150] do
+    if socket.assigns.host? do
+      Rooms.fail_playlist_item(socket.assigns.code, socket.assigns.host_token, item_id)
+    end
+
+    {:noreply,
+     assign(
+       socket,
+       :error,
+       "YouTube couldn’t play this video. Unavailable playlist entries are skipped automatically."
+     )}
+  end
+
   def handle_event("player_error", _params, socket) do
     {:noreply,
      assign(
@@ -195,6 +255,64 @@ defmodule QueuePartyWeb.RoomLive do
   def handle_info({:playback_updated, playback}, socket),
     do: {:noreply, push_event(socket, "room_playback", playback)}
 
+  @impl true
+  def handle_async({:playlist_import, marker, token} = job, {:ok, result}, socket) do
+    if socket.assigns.playlist_job == job do
+      result =
+        case result do
+          {:ok, playlist} ->
+            Rooms.complete_playlist_import(socket.assigns.code, token, marker, playlist)
+
+          error ->
+            error
+        end
+
+      error =
+        case result do
+          {:ok, _room} -> nil
+          {:error, reason} -> playlist_error(reason)
+        end
+
+      {:noreply, assign(socket, playlist_job: nil, playlist_error: error)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_async({:playlist_import, _, _} = job, {:exit, _reason}, socket) do
+    if socket.assigns.playlist_job == job,
+      do:
+        {:noreply,
+         assign(socket,
+           playlist_job: nil,
+           playlist_error: "Playlist import failed. Please try again."
+         )},
+      else: {:noreply, socket}
+  end
+
+  defp playlist_error(:missing_api_key),
+    do:
+      "Playlist imports need YOUTUBE_API_KEY configured on the server. Individual video links still work."
+
+  defp playlist_error(:not_public),
+    do: "That playlist is missing or isn’t public. Choose a public playlist."
+
+  defp playlist_error(:empty), do: "That playlist has no available videos."
+  defp playlist_error(:too_large), do: "Choose a playlist with no more than 200 entries."
+
+  defp playlist_error(:api_access),
+    do:
+      "YouTube denied the import. Check the server API key, API restrictions, and available quota."
+
+  defp playlist_error(:stale_import), do: "This import was superseded by another playlist change."
+
+  defp playlist_error(:forbidden),
+    do: "Host controls changed during the import. The current host can try again."
+
+  defp playlist_error(_),
+    do:
+      "Couldn’t retrieve that playlist. Your existing playlist and requests are unchanged. Try again."
+
   defp assign_room(socket, room) do
     items =
       Enum.with_index(room.items, 1)
@@ -204,6 +322,21 @@ defmodule QueuePartyWeb.RoomLive do
     candidates = Rooms.connected_guests(room)
     participant = Map.get(room.participants, socket.assigns.guest_id)
     host = Map.get(room.participants, room.host_guest_id)
+
+    upcoming =
+      if room.playlist do
+        tracks =
+          if room.playlist.remaining == [] && room.playlist.repeat?,
+            do: room.playlist.tracks,
+            else: room.playlist.remaining
+
+        tracks
+        |> Enum.take(10)
+        |> Enum.with_index(1)
+        |> Enum.map(fn {track, index} -> Map.put(track, :id, "#{room.playlist.id}-#{index}") end)
+      else
+        []
+      end
 
     socket
     |> assign(:host?, host?)
@@ -228,7 +361,14 @@ defmodule QueuePartyWeb.RoomLive do
     |> assign(:playback, Rooms.playback_snapshot(room))
     |> assign(:settings_form, to_form(%{"playback_mode" => room.playback_mode}))
     |> assign(:queue_count, length(items))
+    |> assign(:playlist, room.playlist)
+    |> assign(:playlist_preview_count, length(upcoming))
+    |> assign(
+      :playlist_repeat_form,
+      to_form(%{"repeat" => room.playlist && room.playlist.repeat? == true})
+    )
     |> stream(:items, items, reset: true)
+    |> stream(:playlist_items, upcoming, reset: true)
   end
 
   @impl true
@@ -319,6 +459,71 @@ defmodule QueuePartyWeb.RoomLive do
           </.form>
         </section>
 
+        <section
+          :if={@host?}
+          id="playlist-settings"
+          class="playlist-settings"
+          aria-label="Background playlist settings"
+        >
+          <div class="eyebrow">BACKGROUND PLAYLIST</div>
+          <p>
+            Play next requests take priority after the current song. The playlist then resumes in order.
+          </p>
+          <p :if={!@playlist_configured?} id="playlist-api-warning">
+            Set YOUTUBE_API_KEY on the server to enable playlist imports. Individual links still work.
+          </p>
+          <.form
+            for={@playlist_form}
+            id="playlist-form"
+            phx-submit="load_playlist"
+            class="playlist-form"
+          >
+            <.input
+              field={@playlist_form[:url]}
+              id="playlist-url"
+              type="url"
+              label="Public YouTube playlist URL"
+              placeholder="https://www.youtube.com/playlist?list=…"
+              required
+              class="playlist-url-input"
+            />
+            <button
+              id="load-playlist"
+              type="submit"
+              disabled={!is_nil(@playlist_job)}
+              class="settings-save"
+            >
+              {if @playlist_job, do: "Loading playlist…", else: "Load / replace playlist"}
+            </button>
+          </.form>
+          <.form
+            :if={@playlist}
+            for={@playlist_repeat_form}
+            id="playlist-repeat-form"
+            phx-change="playlist_repeat"
+          >
+            <.input
+              field={@playlist_repeat_form[:repeat]}
+              id="playlist-repeat"
+              type="checkbox"
+              label="Repeat playlist"
+            />
+          </.form>
+          <button
+            :if={@playlist || @playlist_job}
+            id="remove-playlist"
+            type="button"
+            phx-click="remove_playlist"
+            class="settings-save"
+          >Remove playlist</button>
+          <p :if={@playlist_job} id="playlist-loading" role="status">
+            Importing in the background. Playback continues.
+          </p>
+          <p :if={@playlist_error} id="playlist-error" class="error-message" role="alert">
+            {@playlist_error}
+          </p>
+        </section>
+
         <main class="room-layout">
           <section class="player-panel">
             <div class="eyebrow">NOW PLAYING · {if @host?, do: "HOST", else: "GUEST"}</div>
@@ -371,6 +576,9 @@ defmodule QueuePartyWeb.RoomLive do
                 Add a video and playback starts automatically. Your browser may ask you to tap Play.
               </p>
             </div>
+            <h2 :if={@now_playing} id="now-playing-title" class="now-playing-title">
+              {@now_playing.title}
+            </h2>
             <div :if={@now_playing} id="now-playing" class="player-meta">
               <div><span class="live-dot"></span>Added by {@now_playing.submitted_by}</div>
               <button :if={@host?} id="skip-video" phx-click="skip" class="text-button">Skip to next →</button>
@@ -414,19 +622,19 @@ defmodule QueuePartyWeb.RoomLive do
           <aside class="queue-panel">
             <div class="queue-heading">
               <div>
-                <div class="eyebrow">UP NEXT</div><h2>{@queue_count} videos</h2>
+                <div class="eyebrow">PLAY NEXT</div><h2>{@queue_count} videos</h2>
               </div>
               <span class="people-pill">● live room</span>
             </div>
             <div :if={@queue_count == 0} id="queue-empty" class="queue-empty">
-              The queue is empty.<br /><span>Be the first to add something.</span>
+              No individual requests.<br /><span>Add a song to play after the current video.</span>
             </div>
             <ol id="queue" class="queue-list" phx-update="stream">
               <li :for={{dom_id, item} <- @streams.items} id={dom_id} class="queue-item">
                 <span class="queue-number">{item.position}</span>
                 <img src={"https://img.youtube.com/vi/#{item.youtube_id}/mqdefault.jpg"} alt="" />
                 <div class="queue-copy">
-                  <strong>{item.title}</strong><small>added by {item.submitted_by}</small>
+                  <strong title={item.title}>{item.title}</strong><small>added by {item.submitted_by}</small>
                 </div>
                 <button
                   :if={@host?}
@@ -438,6 +646,33 @@ defmodule QueuePartyWeb.RoomLive do
                 >×</button>
               </li>
             </ol>
+            <section
+              id="background-playlist"
+              class="background-playlist"
+              aria-label="Background playlist"
+            >
+              <div class="eyebrow">HOST PLAYLIST</div>
+              <%= if @playlist do %>
+                <h2 id="playlist-title">{@playlist.title}</h2>
+                <p id="playlist-status" role="status">
+                  {length(@playlist.tracks)} available videos · {if @playlist.repeat?,
+                    do: "Repeat on",
+                    else: "Repeat off"}
+                </p>
+                <p :if={@playlist_preview_count == 0} id="playlist-exhausted">
+                  No more playlist tracks. Add requests, load another playlist, or enable repeat.
+                </p>
+                <p :if={@playlist_preview_count > 0}>Next playlist tracks (up to 10):</p>
+              <% else %>
+                <p id="no-playlist">The host can load a playlist to keep the music going.</p>
+              <% end %>
+              <ol id="playlist-tracks" phx-update="stream" class="queue-list">
+                <li :for={{dom_id, track} <- @streams.playlist_items} id={dom_id} class="queue-item">
+                  <img src={"https://img.youtube.com/vi/#{track.youtube_id}/mqdefault.jpg"} alt="" />
+                  <div class="queue-copy"><strong title={track.title}>{track.title}</strong></div>
+                </li>
+              </ol>
+            </section>
           </aside>
         </main>
 

@@ -2,6 +2,16 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import hook from "../../assets/js/youtube_player.mjs"
 
+test("player errors identify the active item and ignore stale-video errors", async t => {
+  const {player, sent, context} = await mount(t)
+  player.config.events.onError({data: 150})
+  assert.deepEqual(sent.at(-1), ["player_error", {item_id: "first-item", code: 150}])
+  context.el.dataset.videoId = "different-video"
+  const count = sent.length
+  player.config.events.onError({data: 150})
+  assert.equal(sent.length, count)
+})
+
 test("host handoff changes reporting authority without restarting the song", async t => {
   const {player, states, sent, update, tick, calls} = await mount(t, {host: false, position: 42})
   player.emit(states.PLAYING)
