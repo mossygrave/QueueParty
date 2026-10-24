@@ -347,6 +347,20 @@ defmodule QueuePartyWeb.RoomLive do
     participant = Map.get(room.participants, socket.assigns.guest_id)
     host = Map.get(room.participants, room.host_guest_id)
 
+    participants =
+      room.participants
+      |> Map.values()
+      |> Enum.filter(&(map_size(&1.connections) > 0))
+      |> Enum.sort_by(&{if(&1.id == room.host_guest_id, do: 0, else: 1), &1.order})
+      |> Enum.map(fn person ->
+        %{
+          id: person.id,
+          name: person.name,
+          host?: person.id == room.host_guest_id,
+          self?: person.id == socket.assigns.guest_id
+        }
+      end)
+
     upcoming =
       if room.playlist do
         tracks =
@@ -386,6 +400,7 @@ defmodule QueuePartyWeb.RoomLive do
     |> assign(:playback, Rooms.playback_snapshot(room))
     |> assign(:settings_form, to_form(%{"playback_mode" => room.playback_mode}))
     |> assign(:queue_count, length(items))
+    |> assign(:participant_count, length(participants))
     |> assign(:playlist, room.playlist)
     |> assign(:playlist_preview_count, length(upcoming))
     |> assign(
@@ -394,6 +409,7 @@ defmodule QueuePartyWeb.RoomLive do
     )
     |> stream(:items, items, reset: true)
     |> stream(:playlist_items, upcoming, reset: true)
+    |> stream(:participants, participants, reset: true)
   end
 
   @impl true
@@ -767,6 +783,25 @@ defmodule QueuePartyWeb.RoomLive do
                   <div class="queue-copy"><strong title={track.title}>{track.title}</strong></div>
                 </li>
               </ol>
+            </section>
+            <section id="room-people" class="room-people" aria-labelledby="room-people-title">
+              <div class="room-people-heading">
+                <h2 id="room-people-title">People in this room</h2>
+                <span id="participant-count" class="participant-count" role="status">
+                  {@participant_count} connected
+                </span>
+              </div>
+              <ul id="participants" class="participant-list" phx-update="stream">
+                <li :for={{dom_id, person} <- @streams.participants} id={dom_id} class="participant">
+                  <span class="participant-dot" aria-hidden="true"></span>
+                  <span class="participant-display-name">{person.name}</span>
+                  <span :if={person.self?} class="participant-you">You</span>
+                  <span :if={person.host?} class="participant-host">Host</span>
+                </li>
+              </ul>
+              <p :if={@participant_count == 0} id="participants-empty" class="participants-empty">
+                Connecting to the room…
+              </p>
             </section>
           </aside>
         </main>

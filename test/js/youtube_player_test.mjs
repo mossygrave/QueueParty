@@ -34,7 +34,177 @@ test("a guest promoted after the song ended can advance it", async t => {
   assert.deepEqual(sent.at(-1), ["video_ended", {item_id: "first-item"}])
 })
 
-async function mount(t, {host = true, position = 0, status = "playing", destroyBeforeAPI = false} = {}) {
+test("buffering snapshots never repeatedly rewind or pause a guest", async t => {
+  const {player, states, receive, tick, calls} = await mount(t, {host: false})
+  player.emit(states.PLAYING)
+  receive({item_id: "first-item", status: "buffering", position: 0, revision: 2})
+  player.position = 2
+  tick(); tick(); tick()
+  assert.equal(calls.filter(([name]) => name === "seek" || name === "pause").length, 0)
+  assert.equal(player.position, 2)
+  receive({item_id: "first-item", status: "playing", position: 10, revision: 3})
+  assert.deepEqual(calls.at(-1), ["seek", 10])
+})
+
+test("guests finish loading before drift correction and do not restart ended songs", async t => {
+  const {player, states, receive, tick, advance, calls, update} = await mount(t, {host: false})
+  advance(5000); tick(); tick()
+  assert.equal(calls.length, 1, "do not keep seeking a player that is still loading")
+  player.position = 100
+  player.emit(states.PLAYING)
+  player.emit(states.ENDED)
+  const count = calls.length
+  tick(); tick()
+  receive({item_id: "first-item", status: "playing", position: 100, revision: 2})
+  assert.equal(calls.length, count, "wait for the host's next track, rather than replaying")
+  update({itemId: "next-item", videoId: "next-video", playbackPosition: "0", playbackRevision: "3"})
+  assert.deepEqual(calls.at(-1), ["load", {videoId: "next-video", startSeconds: 0}])
+})
+
+test("a lagging promoted host waits for an asynchronous seek before reporting", async t => {
+  const {player, states, update, tick, sent, calls} = await mount(t, {host: false})
+  player.emit(states.PLAYING)
+  player.seekTo = position => { calls.push(["seek", position]); player.state = states.BUFFERING }
+  update({host: "true", playbackPosition: "45", playbackRevision: "2"})
+  tick(); tick()
+  assert.equal(sent.length, 0, "do not overwrite the room's playhead with zero")
+  assert.equal(calls.filter(([name]) => name === "seek").length, 1)
+  player.position = 45
+  player.emit(states.PLAYING)
+  assert.deepEqual(sent.at(-1), ["playback_update", {item_id: "first-item", status: "playing", position: 45}])
+  player.emit(states.ENDED)
+  tick(); player.emit(states.ENDED)
+  assert.equal(sent.filter(([name]) => name === "video_ended").length, 1)
+  update({itemId: "playlist-b", videoId: "second-video", playbackPosition: "0", playbackRevision: "3"})
+  player.emit(states.PLAYING); player.emit(states.ENDED)
+  assert.deepEqual(sent.at(-1), ["video_ended", {item_id: "playlist-b"}])
+})
+
+test("an autoplay-blocked promotion preserves the room position until the host enables audio", async t => {
+  const {player, states, context, update, tick, sent, elementListeners} = await mount(t, {host: false})
+  player.config.events.onAutoplayBlocked()
+  sent.length = 0
+  update({host: "true", playbackPosition: "45", playbackRevision: "2"})
+  tick()
+  assert.equal(sent.length, 0)
+  assert.equal(context.handoff.prepared, false)
+  elementListeners.get("queueparty:enable-audio")()
+  assert.equal(player.position, 45)
+  player.emit(states.PLAYING)
+  assert.deepEqual(sent.at(-1), ["playback_update", {item_id: "first-item", status: "playing", position: 45}])
+})
+
+test("promotion can settle a paused, never-started player without playing it", async t => {
+  const {player, states, update, sent, calls} = await mount(t, {host: false, status: "paused", position: 0})
+  update({host: "true", playbackStatus: "paused", playbackPosition: "45", playbackRevision: "2"})
+  assert.equal(player.state, states.PAUSED)
+  assert.equal(calls.some(([name]) => name === "play"), false)
+  assert.deepEqual(sent.at(-1), ["playback_update", {item_id: "first-item", status: "paused", position: 45}])
+  player.emit(states.PLAYING); player.emit(states.ENDED)
+  assert.deepEqual(sent.at(-1), ["video_ended", {item_id: "first-item"}])
+})
+
+test("demotion cancels a pending handoff and late callbacks cannot report or finish", async t => {
+  const {player, states, update, tick, sent} = await mount(t, {host: false})
+  player.seekTo = () => { player.state = states.BUFFERING }
+  update({host: "true", playbackPosition: "45", playbackRevision: "2"})
+  update({host: "false", playbackPosition: "45", playbackRevision: "3"})
+  player.position = 45
+  player.emit(states.PLAYING); player.emit(states.ENDED); tick()
+  assert.equal(sent.length, 0)
+})
+
+test("late wrong-video ends, duplicate ends and offline ends cannot advance the room", async t => {
+  const {context, player, sent, states, tick} = await mount(t)
+  player.emit(states.PLAYING)
+  player.videoId = "previous-video"
+  player.emit(states.ENDED)
+  assert.equal(sent.some(([name]) => name === "video_ended"), false)
+  player.videoId = "first-video"
+  hook.disconnected.call(context)
+  player.emit(states.ENDED)
+  assert.equal(sent.some(([name]) => name === "video_ended"), false)
+  hook.reconnected.call(context)
+  tick(); player.emit(states.ENDED)
+  assert.equal(sent.filter(([name]) => name === "video_ended").length, 1)
+})
+
+test("promotion does not replace a newer received snapshot with stale DOM data", async t => {
+  const {player, states, receive, update, sent} = await mount(t, {host: false})
+  player.emit(states.PLAYING)
+  receive({item_id: "first-item", status: "paused", position: 90, revision: 5})
+  update({host: "true", playbackPosition: "0", playbackRevision: "1"})
+  assert.deepEqual(sent.at(-1), ["playback_update", {item_id: "first-item", status: "paused", position: 90}])
+})
+
+test("promotion while the guest is cued for host buffering starts playback at the saved position", async t => {
+  const {player, states, update, sent, calls} = await mount(t, {host: false, status: "paused"})
+  update({host: "true", playbackStatus: "buffering", playbackPosition: "45", playbackRevision: "2"})
+  player.emit(states.PLAYING)
+  assert.equal(calls.some(([name, position]) => name === "seek" && position === 45), true)
+  assert.deepEqual(sent.at(-1), ["playback_update", {item_id: "first-item", status: "playing", position: 45}])
+  player.emit(states.ENDED)
+  assert.deepEqual(sent.at(-1), ["video_ended", {item_id: "first-item"}])
+})
+
+test("a new track arriving during handoff cancels the old seek and stale end", async t => {
+  const {player, states, update, sent, calls} = await mount(t, {host: false})
+  player.seekTo = position => { calls.push(["seek", position]); player.state = states.BUFFERING }
+  update({host: "true", playbackPosition: "45", playbackRevision: "2"})
+  update({itemId: "playlist-b", videoId: "second-video", playbackPosition: "0", playbackRevision: "3"})
+  player.emit(states.ENDED)
+  assert.equal(sent.some(([name]) => name === "video_ended"), false)
+  assert.deepEqual(calls.at(-1), ["load", {videoId: "second-video", startSeconds: 0}])
+  player.emit(states.PLAYING); player.emit(states.ENDED)
+  assert.deepEqual(sent.at(-1), ["video_ended", {item_id: "playlist-b"}])
+})
+
+test("host-only handoff with a fresh player cannot report its initial zero position", async t => {
+  const {player, states, sent, tick} = await mount(t, {position: 45})
+  player.position = 0
+  player.emit(states.PLAYING); tick()
+  assert.equal(sent.length, 0)
+  player.position = 45
+  player.emit(states.PLAYING)
+  assert.deepEqual(sent.at(-1), ["playback_update", {item_id: "first-item", status: "playing", position: 45}])
+})
+
+test("promotion before the API is ready keeps its synchronization guard", async t => {
+  const {context, player, states, update, sent, calls} = await mount(t, {host: false, deferReady: true})
+  update({host: "true", playbackPosition: "45", playbackRevision: "2"})
+  assert.notEqual(context.handoff, null)
+  player.config.events.onReady()
+  assert.deepEqual(calls.at(-1), ["load", {videoId: "first-video", startSeconds: 45}])
+  assert.equal(sent.length, 0)
+  player.emit(states.PLAYING)
+  assert.equal(sent.at(-1)[1].position, 45)
+})
+
+test("reconnecting a blocked guest refreshes the snapshot without retrying autoplay", async t => {
+  const {context, player, calls, server} = await mount(t, {host: false})
+  player.config.events.onAutoplayBlocked()
+  const count = calls.length
+  server({item_id: "first-item", status: "playing", position: 45, revision: 2})
+  hook.reconnected.call(context)
+  assert.equal(context.snapshot.position, 45)
+  assert.equal(calls.length, count)
+})
+
+test("a blocked new host tapping the YouTube player catches up before reporting", async t => {
+  const {player, states, update, sent, calls} = await mount(t, {host: false})
+  player.config.events.onAutoplayBlocked()
+  sent.length = 0
+  update({host: "true", playbackPosition: "45", playbackRevision: "2"})
+  player.seekTo = position => { calls.push(["seek", position]); player.state = states.BUFFERING }
+  player.emit(states.PLAYING)
+  assert.equal(sent.length, 0)
+  assert.deepEqual(calls.at(-1), ["seek", 45])
+  player.position = 45
+  player.emit(states.PLAYING)
+  assert.equal(sent.at(-1)[1].position, 45)
+})
+
+async function mount(t, {host = true, position = 0, status = "playing", destroyBeforeAPI = false, deferReady = false} = {}) {
   let clock = 0
   let tick
   const calls = []
@@ -109,7 +279,7 @@ async function mount(t, {host = true, position = 0, status = "playing", destroyB
   hook.mounted.call(context)
   if (destroyBeforeAPI) hook.destroyed.call(context)
   await Promise.resolve()
-  if (!destroyBeforeAPI) context.player.config.events.onReady()
+  if (!destroyBeforeAPI && !deferReady) context.player.config.events.onReady()
 
   return {
     context, calls, sent, states, elementListeners, documentListeners,
@@ -181,7 +351,8 @@ test("a paused late joiner stays paused and stale snapshots cannot rewind it", a
 })
 
 test("guests correct drift without seeking on small timing differences", async t => {
-  const {player, calls, advance, tick} = await mount(t, {host: false, position: 50})
+  const {player, calls, advance, tick, states} = await mount(t, {host: false, position: 50})
+  player.emit(states.PLAYING)
   advance(2000)
   player.position = 51.8
   tick()

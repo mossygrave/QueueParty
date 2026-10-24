@@ -30,6 +30,7 @@ export default {
     this.connected = true
     this.isHost = this.el.dataset.host === "true"
     this.autoplayBlocked = false
+    this.handoff = null
     this.snapshot = {
       item_id: this.el.dataset.itemId,
       status: this.el.dataset.playbackStatus,
@@ -37,6 +38,8 @@ export default {
       revision: Number(this.el.dataset.playbackRevision) || 0
     }
     this.snapshotAt = performance.now()
+    // In host-only mode a transfer creates a fresh player on the new host.
+    if (this.isHost && this.snapshot.position > 0) this.handoff = {prepared: false}
 
     this.targetPosition = () => this.snapshot.position + (
       this.snapshot.status === "playing" ? (performance.now() - this.snapshotAt) / 1000 : 0
@@ -47,9 +50,10 @@ export default {
       if (this.activeItemId === this.el.dataset.itemId) return false
       this.activeItemId = this.el.dataset.itemId
       this.playingItemId = null
+      this.endedReportedItemId = null
       this.loadingItem = true
       const video = {videoId: this.el.dataset.videoId, startSeconds: this.targetPosition()}
-      if (this.snapshot.status === "playing" && !this.autoplayBlocked) {
+      if (this.snapshot.status !== "paused" && !this.autoplayBlocked) {
         this.player.loadVideoById(video)
       } else {
         this.player.cueVideoById(video)
@@ -60,18 +64,75 @@ export default {
     this.syncGuest = (force = false) => {
       if (!this.ready || this.disposed || !this.connected || this.isHost) return
       if (this.syncVideo()) return
-      if (this.autoplayBlocked && !force) return
+      if (this.autoplayBlocked) return
+      const state = this.player.getPlayerState()
+      // Buffering is not a seek command. Repeatedly seeking a loading player
+      // back to a frozen host position can keep it stuck at the first second.
+      if (state === window.YT.PlayerState.ENDED && this.playingItemId === this.activeItemId) return
+      if (this.snapshot.status === "buffering") return
+      if (!force && this.snapshot.status === "playing" && (
+        this.loadingItem || state === window.YT.PlayerState.BUFFERING
+      )) return
       const position = this.targetPosition()
-      if (force || Math.abs(this.player.getCurrentTime() - position) > 1.5) {
+      const needsSeek = force || Math.abs(this.player.getCurrentTime() - position) > 1.5
+      if (needsSeek) {
         this.player.seekTo(position, true)
       }
-      const state = this.player.getPlayerState()
       if (this.snapshot.status === "playing") {
         if (state !== window.YT.PlayerState.PLAYING && state !== window.YT.PlayerState.BUFFERING) {
           this.player.playVideo()
         }
-      } else if (state !== window.YT.PlayerState.PAUSED && state !== window.YT.PlayerState.CUED) {
+      } else if (needsSeek || (state !== window.YT.PlayerState.PAUSED && state !== window.YT.PlayerState.CUED)) {
         this.player.pauseVideo()
+      }
+    }
+
+    this.finishHostItem = () => {
+      if (!this.isHost || !this.ready || this.disposed || !this.connected || this.handoff || this.loadingItem) return
+      if (this.activeItemId !== this.el.dataset.itemId || this.playingItemId !== this.activeItemId) return
+      if (this.player.getVideoData().video_id !== this.el.dataset.videoId) return
+      if (this.player.getPlayerState() !== window.YT.PlayerState.ENDED || this.endedReportedItemId === this.activeItemId) return
+      this.endedReportedItemId = this.activeItemId
+      this.pushEvent("video_ended", {item_id: this.activeItemId})
+    }
+
+    this.settleHandoff = () => {
+      if (!this.handoff || !this.ready || !this.connected || this.disposed) return
+      this.syncVideo()
+      if (this.player.getVideoData().video_id !== this.el.dataset.videoId) return
+      const states = window.YT.PlayerState
+      const state = this.player.getPlayerState()
+      if (!this.handoff.prepared && state === states.ENDED && !this.loadingItem &&
+        this.playingItemId === this.activeItemId && this.snapshot.status !== "paused") {
+        this.handoff = null
+        this.finishHostItem()
+        return
+      }
+      if (this.autoplayBlocked) return
+      if (!this.handoff.prepared) {
+        this.handoff = {prepared: true, position: this.targetPosition(), at: performance.now()}
+        const needsSeek = Math.abs(this.player.getCurrentTime() - this.handoff.position) > 1.5
+        if (needsSeek) {
+          this.player.seekTo(this.handoff.position, true)
+        }
+        if (this.snapshot.status === "paused") {
+          if (needsSeek || (state !== states.PAUSED && state !== states.CUED)) this.player.pauseVideo()
+        } else if (state !== states.PLAYING && state !== states.BUFFERING) {
+          this.player.playVideo()
+        }
+      }
+      // seekTo/playVideo are asynchronous. Do not publish the old local
+      // position until the seek has landed and the desired state is ready.
+      const position = this.player.getCurrentTime()
+      const elapsed = (performance.now() - this.handoff.at) / 1000
+      const paused = this.snapshot.status === "paused"
+      const currentState = this.player.getPlayerState()
+      const settledState = paused ? [states.PAUSED, states.CUED].includes(currentState) : currentState === states.PLAYING
+      if (settledState && Number.isFinite(position) && position >= this.handoff.position - 1.5 &&
+        position <= this.handoff.position + (paused ? 0 : elapsed) + 1.5) {
+        this.handoff = null
+        this.loadingItem = false
+        if (!paused) this.playingItemId = this.activeItemId
       }
     }
 
@@ -83,14 +144,17 @@ export default {
       )) return
       this.snapshot = snapshot
       this.snapshotAt = performance.now()
-      this.syncGuest()
+      this.syncGuest(force)
     }
 
     this.reportHost = (override) => {
-      if (!this.isHost || !this.ready || this.disposed || !this.connected || this.loadingItem) return
+      if (!this.isHost || !this.ready || this.disposed || !this.connected) return
+      this.settleHandoff()
+      if (this.handoff || this.loadingItem || this.activeItemId !== this.el.dataset.itemId) return
       const actualVideo = this.player.getVideoData().video_id
       if (actualVideo !== this.el.dataset.videoId) return
-      const status = override || ({1: "playing", 2: "paused", 3: "buffering"})[this.player.getPlayerState()]
+      this.finishHostItem()
+      const status = override || ({1: "playing", 2: "paused", 3: "buffering", 5: "paused"})[this.player.getPlayerState()]
       const position = this.player.getCurrentTime()
       if (!status || !Number.isFinite(position)) return
       this.pushEvent("playback_update", {item_id: this.activeItemId, status, position})
@@ -110,7 +174,12 @@ export default {
 
     this.enableAudio = () => {
       this.autoplayBlocked = false
-      this.syncGuest(true)
+      if (this.isHost && this.handoff) {
+        this.handoff.prepared = false
+        this.reportHost()
+      } else {
+        this.syncGuest(true)
+      }
     }
     this.onVisible = () => {
       if (document.visibilityState === "visible") this.requestSnapshot()
@@ -134,19 +203,19 @@ export default {
             if (this.disposed) return
             this.ready = true
             this.syncVideo()
+            if (this.handoff) this.reportHost()
           },
           onStateChange: event => {
             if (this.disposed) return
+            if (this.activeItemId !== this.el.dataset.itemId || this.player.getVideoData().video_id !== this.el.dataset.videoId) return
             if (event.data === YT.PlayerState.PLAYING) {
-              if (this.player.getVideoData().video_id !== this.el.dataset.videoId) return
+              if (this.autoplayBlocked && this.handoff) this.handoff.prepared = false
               this.playingItemId = this.activeItemId
               this.loadingItem = false
               this.autoplayBlocked = false
             }
             this.reportHost()
-            if (this.isHost && event.data === YT.PlayerState.ENDED && this.playingItemId === this.activeItemId) {
-              this.pushEvent("video_ended", {item_id: this.playingItemId})
-            }
+            if (event.data === YT.PlayerState.ENDED) this.finishHostItem()
           },
           onError: event => {
             if (this.disposed) return
@@ -181,21 +250,24 @@ export default {
       revision: Number(this.el.dataset.playbackRevision) || 0
     }
     if (wasHost !== this.isHost) {
-      this.snapshot = snapshot
-      this.snapshotAt = performance.now()
+      if (snapshot.item_id !== this.snapshot.item_id || snapshot.revision >= this.snapshot.revision) {
+        this.snapshot = snapshot
+        this.snapshotAt = performance.now()
+      }
+      this.handoff = this.isHost ? {prepared: false} : null
+      if (this.isHost) this.endedReportedItemId = null
       if (this.isHost) {
-        if (this.ready && this.player.getPlayerState() === window.YT.PlayerState.ENDED && this.playingItemId === snapshot.item_id) {
-          this.pushEvent("video_ended", {item_id: snapshot.item_id})
-        } else {
-          this.reportHost()
-        }
+        this.reportHost()
       } else {
         this.syncGuest(true)
       }
     }
     if (this.isHost && this.activeItemId !== snapshot.item_id) {
-      this.snapshot = snapshot
-      this.snapshotAt = performance.now()
+      if (wasHost) this.handoff = null
+      if (snapshot.item_id !== this.snapshot.item_id || snapshot.revision >= this.snapshot.revision) {
+        this.snapshot = snapshot
+        this.snapshotAt = performance.now()
+      }
       this.syncVideo()
     } else {
       this.receiveSnapshot(snapshot)

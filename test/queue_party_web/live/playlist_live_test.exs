@@ -87,6 +87,67 @@ defmodule QueuePartyWeb.PlaylistLiveTest do
     assert Rooms.get_room(room.code).now_playing.id == next.id
   end
 
+  test "playlist advancement and requests survive repeated host handoffs and late end events", %{
+    room: room,
+    host: host,
+    guest: guest
+  } do
+    load(host)
+    host |> form("#playback-settings", playback_mode: "everyone") |> render_change()
+    host |> form("#playlist-repeat-form", repeat: true) |> render_change()
+    original_host = Rooms.get_room(room.code).host_guest_id
+    first = Rooms.get_room(room.code).now_playing
+    render_hook(host, "playback_update", %{item_id: first.id, status: "playing", position: 45})
+    guest |> form("#add-video", url: "https://youtu.be/title000003") |> render_submit()
+    request = hd(Rooms.get_room(room.code).items)
+    host |> form("#transfer-host-form", guest_id: "playlist-guest") |> render_submit()
+    assert has_element?(guest, "#youtube-player[data-host=true]")
+    assert Rooms.get_room(room.code).playback.position == 45
+    render_hook(host, "video_ended", %{item_id: first.id})
+    render_hook(host, "playback_update", %{item_id: first.id, status: "paused", position: 0})
+    assert Rooms.get_room(room.code).now_playing.id == first.id
+    assert Rooms.get_room(room.code).playback.position == 45
+    render_hook(guest, "video_ended", %{item_id: first.id})
+    assert has_element?(host, "#youtube-player[data-item-id='#{request.id}']")
+    render_hook(guest, "video_ended", %{item_id: first.id})
+    assert Rooms.get_room(room.code).now_playing.id == request.id
+    render_hook(guest, "video_ended", %{item_id: request.id})
+    second = Rooms.get_room(room.code).now_playing
+    assert has_element?(host, "#now-playing-title", "Playlist B")
+    guest |> form("#transfer-host-form", guest_id: original_host) |> render_submit()
+    render_hook(guest, "video_ended", %{item_id: second.id})
+    assert Rooms.get_room(room.code).now_playing.id == second.id
+    render_hook(host, "video_ended", %{item_id: second.id})
+    repeated = Rooms.get_room(room.code).now_playing
+    refute repeated.id == first.id
+    assert has_element?(guest, "#now-playing-title", "Playlist A")
+    render_hook(host, "video_ended", %{item_id: second.id})
+    assert Rooms.get_room(room.code).now_playing.id == repeated.id
+  end
+
+  test "host-only transfer gives the new player the saved playhead and next playlist track", %{
+    room: room,
+    host: host,
+    guest: guest
+  } do
+    load(host)
+    first = Rooms.get_room(room.code).now_playing
+    render_hook(host, "playback_update", %{item_id: first.id, status: "paused", position: 45})
+    refute has_element?(guest, "#youtube-player")
+    host |> form("#transfer-host-form", guest_id: "playlist-guest") |> render_submit()
+
+    assert has_element?(
+             guest,
+             "#youtube-player[data-host=true][data-playback-position='45'][data-playback-status=paused]"
+           )
+
+    refute has_element?(host, "#youtube-player")
+    render_hook(guest, "playback_update", %{item_id: first.id, status: "playing", position: 45})
+    render_hook(guest, "video_ended", %{item_id: first.id})
+    assert has_element?(guest, "#now-playing-title", "Playlist B")
+    assert has_element?(guest, "#youtube-player[data-playback-position='0.0']")
+  end
+
   test "missing server key is explained and individual requests still work", %{room: room} do
     previous = Application.get_env(:queue_party, :youtube_api_key)
     Application.delete_env(:queue_party, :youtube_api_key)
