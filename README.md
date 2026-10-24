@@ -39,11 +39,15 @@ mix setup
 4. Open `http://COMPUTER-IP:4000` on the host and guest devices. A phone's `localhost` points to the phone, not the computer.
 5. Start a room on the device that will play the videos. Guests join using its five-character room code or the **Copy invite** link.
 6. Add YouTube links. The first video starts automatically when the room is idle; later submissions join the queue. Playback advances when each video ends. If the queue runs out, the next submitted video starts a new listening session automatically. Adding a video does not interrupt or resume a paused song.
-7. In **Room settings → Play music on**, the host can choose **Host device only** (the default) or **Every device**. The setting changes live for everyone in the room.
+7. Open **Host controls** next to the invite button, then use **Room settings → Play music on** to choose **Host device only** (the default) or **Every device**. The setting changes live for everyone in the room.
+
+**Host controls** starts collapsed to keep the player and queue in view. It contains playback mode, skip-vote settings, host transfer, and background playlist controls. Toggle the button again, choose **Close**, or press Escape to collapse it. Closing the panel does not stop playback or an in-progress playlist import. Skip/approve-skip buttons and queue reordering stay beside the player and queue for quick access. The panel is host-only and follows host transfers.
 
 With **Every device**, guests get their own YouTube player following the host's current song, play/pause state, and playhead. Late joiners start near the current position. If a browser blocks audio, tap **Play on this device** or the YouTube play button. The host controls playback; guest skip requests can also advance the queue at the configured vote threshold. Guests control their own volume. Switching back to **Host device only** stops the guest players.
 
-Video titles are fetched in the background from YouTube's public oEmbed endpoint, without an API key. They appear in **Up next** and **Now playing** for everyone in the room. Playback starts immediately; a video-ID label is shown until its title arrives. If YouTube is unavailable, rate-limits the lookup, or cannot return metadata for a video, that fallback label stays and playback is unaffected. New submissions are looked up; existing items are not automatically backfilled after an upgrade.
+Video titles are fetched in the background from YouTube's public oEmbed endpoint, without an API key. They appear in **Play next** and **Now playing** for everyone in the room. Playback starts immediately; a video-ID label is shown until its title arrives. If YouTube is unavailable, rate-limits the lookup, or cannot return metadata for a video, that fallback label stays and playback is unaffected. New submissions are looked up; existing items are not automatically backfilled after an upgrade.
+
+The host can reorder **Play next** by dragging a song's grip with a mouse or touch. An orange line shows the drop position. For keyboard access, focus a grip and use the up/down arrow keys; Escape cancels an active drag. Everyone receives the new order immediately. Reordering never interrupts the current video or changes the background playlist. New submissions are preserved if they arrive during a drag; if the moved song or its destination has already left the queue, the move is safely rejected. Guests cannot reorder, and host controls follow a host transfer.
 
 ### Background playlists and Play next
 

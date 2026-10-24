@@ -34,6 +34,7 @@ defmodule QueuePartyWeb.RoomLive do
          |> assign(:video_form, to_form(%{"url" => ""}))
          |> assign(:name_form, to_form(%{"name" => name}))
          |> assign(:error, nil)
+         |> assign(:host_menu_open?, false)
          |> assign(:playlist_form, to_form(%{"url" => ""}))
          |> assign(:playlist_job, nil)
          |> assign(:playlist_error, nil)
@@ -47,6 +48,15 @@ defmodule QueuePartyWeb.RoomLive do
   end
 
   @impl true
+  def handle_event("toggle_host_menu", _params, socket) do
+    {:noreply,
+     assign(socket, :host_menu_open?, socket.assigns.host? && !socket.assigns.host_menu_open?)}
+  end
+
+  def handle_event("close_host_menu", _params, socket) do
+    {:noreply, assign(socket, :host_menu_open?, false)}
+  end
+
   def handle_event("load_playlist", %{"url" => url}, socket) do
     with true <- socket.assigns.host?,
          {:ok, _id} <- YouTubePlaylist.playlist_id(url),
@@ -140,6 +150,20 @@ defmodule QueuePartyWeb.RoomLive do
       do: Rooms.remove_item(socket.assigns.code, id, socket.assigns.host_token)
 
     {:noreply, socket}
+  end
+
+  def handle_event("move_queue_item", %{"id" => id, "before_id" => before_id}, socket) do
+    case Rooms.move_item(socket.assigns.code, socket.assigns.host_token, id, before_id) do
+      {:ok, room} ->
+        {:noreply, socket |> assign_room(room) |> push_event("queue_reordered", %{id: id})}
+
+      {:error, :stale_queue} ->
+        {:noreply,
+         put_flash(socket, :error, "The queue changed. Please try moving that song again.")}
+
+      _ ->
+        {:noreply, socket}
+    end
   end
 
   def handle_event("skip", _params, socket) do
@@ -340,6 +364,7 @@ defmodule QueuePartyWeb.RoomLive do
 
     socket
     |> assign(:host?, host?)
+    |> assign(:host_menu_open?, host? && socket.assigns.host_menu_open?)
     |> assign(:host_token, if(host?, do: room.host_token))
     |> assign(:host_status, room.host_status)
     |> assign(:host_name, if(host, do: host.name, else: "Host"))
@@ -386,6 +411,17 @@ defmodule QueuePartyWeb.RoomLive do
               data-path={~p"/room/#{@code}"}
               class="copy-link"
             >Copy invite</button>
+            <button
+              :if={@host?}
+              id="toggle-host-controls"
+              type="button"
+              phx-click="toggle_host_menu"
+              aria-expanded={to_string(@host_menu_open?)}
+              aria-controls="host-controls"
+              class="host-controls-toggle"
+            >
+              Host controls <span aria-hidden="true">{if @host_menu_open?, do: "−", else: "+"}</span>
+            </button>
           </div>
         </header>
 
@@ -400,128 +436,159 @@ defmodule QueuePartyWeb.RoomLive do
           <% end %>
         </div>
 
-        <section :if={@host?} id="room-settings" class="room-settings" aria-label="Room settings">
-          <div>
-            <div class="eyebrow">ROOM SETTINGS</div>
-            <p>Choose where everyone listens. You stay in control of playback.</p>
-          </div>
-          <.form
-            for={@settings_form}
-            id="playback-settings"
-            phx-change="set_playback_mode"
-            phx-submit="set_playback_mode"
-          >
-            <.input
-              field={@settings_form[:playback_mode]}
-              id="playback-mode"
-              type="select"
-              label="Play music on"
-              class="playback-select"
-              options={[{"Host device only", "host_only"}, {"Every device", "everyone"}]}
-            />
-          </.form>
-          <.form for={@skip_form} id="skip-settings" phx-submit="set_skip_threshold">
-            <.input
-              field={@skip_form[:skip_threshold]}
-              id="skip-threshold"
-              type="number"
-              label="Votes needed to skip"
-              min="1"
-              max="100"
-              step="1"
-              required
-              class="playback-select"
-            />
-            <button id="save-skip-threshold" type="submit" class="settings-save">Save</button>
-            <p>Default: 3 votes. Lowering the limit can skip the current song immediately.</p>
-          </.form>
-          <.form for={@transfer_form} id="transfer-host-form" phx-submit="transfer_host">
-            <.input
-              field={@transfer_form[:guest_id]}
-              id="transfer-host-guest"
-              type="select"
-              label="Transfer host"
-              prompt="Choose a connected guest"
-              options={@transfer_options}
-              required
-              class="playback-select"
-            />
-            <button
-              id="transfer-host"
-              type="submit"
-              class="settings-save"
-              disabled={@transfer_options == []}
-              data-confirm="Transfer host controls? You will become a guest."
-            >
-              Pass host controls
-            </button>
-            <p>Your queue and settings stay the same. The new host keeps control when you return.</p>
-          </.form>
-        </section>
-
         <section
           :if={@host?}
-          id="playlist-settings"
-          class="playlist-settings"
-          aria-label="Background playlist settings"
+          id="host-controls"
+          class="host-controls"
+          aria-labelledby="host-controls-title"
+          hidden={!@host_menu_open?}
+          phx-window-keydown={
+            if(@host_menu_open?,
+              do: JS.push("close_host_menu") |> JS.focus(to: "#toggle-host-controls")
+            )
+          }
+          phx-key="Escape"
         >
-          <div class="eyebrow">BACKGROUND PLAYLIST</div>
-          <p>
-            Play next requests take priority after the current song. The playlist then resumes in order.
-          </p>
-          <p :if={!@playlist_configured?} id="playlist-api-warning">
-            Set YOUTUBE_API_KEY on the server to enable playlist imports. Individual links still work.
-          </p>
-          <.form
-            for={@playlist_form}
-            id="playlist-form"
-            phx-submit="load_playlist"
-            class="playlist-form"
-          >
-            <.input
-              field={@playlist_form[:url]}
-              id="playlist-url"
-              type="url"
-              label="Public YouTube playlist URL"
-              placeholder="https://www.youtube.com/playlist?list=…"
-              required
-              class="playlist-url-input"
-            />
+          <div class="host-controls-heading">
+            <div>
+              <h2 id="host-controls-title">Your room, your rules.</h2>
+              <p>Adjust the settings, then get back to the music.</p>
+            </div>
             <button
-              id="load-playlist"
-              type="submit"
-              disabled={!is_nil(@playlist_job)}
-              class="settings-save"
+              id="close-host-controls"
+              type="button"
+              phx-click={JS.push("close_host_menu") |> JS.focus(to: "#toggle-host-controls")}
+              class="host-controls-close"
             >
-              {if @playlist_job, do: "Loading playlist…", else: "Load / replace playlist"}
+              Close <span aria-hidden="true">×</span>
             </button>
-          </.form>
-          <.form
-            :if={@playlist}
-            for={@playlist_repeat_form}
-            id="playlist-repeat-form"
-            phx-change="playlist_repeat"
-          >
-            <.input
-              field={@playlist_repeat_form[:repeat]}
-              id="playlist-repeat"
-              type="checkbox"
-              label="Repeat playlist"
-            />
-          </.form>
-          <button
-            :if={@playlist || @playlist_job}
-            id="remove-playlist"
-            type="button"
-            phx-click="remove_playlist"
-            class="settings-save"
-          >Remove playlist</button>
-          <p :if={@playlist_job} id="playlist-loading" role="status">
-            Importing in the background. Playback continues.
-          </p>
-          <p :if={@playlist_error} id="playlist-error" class="error-message" role="alert">
-            {@playlist_error}
-          </p>
+          </div>
+          <div class="host-controls-grid">
+            <section id="room-settings" class="room-settings" aria-label="Room settings">
+              <div>
+                <div class="eyebrow">ROOM SETTINGS</div>
+                <p>Choose where everyone listens. You stay in control of playback.</p>
+              </div>
+              <.form
+                for={@settings_form}
+                id="playback-settings"
+                phx-change="set_playback_mode"
+                phx-submit="set_playback_mode"
+              >
+                <.input
+                  field={@settings_form[:playback_mode]}
+                  id="playback-mode"
+                  type="select"
+                  label="Play music on"
+                  class="playback-select"
+                  options={[{"Host device only", "host_only"}, {"Every device", "everyone"}]}
+                />
+              </.form>
+              <.form for={@skip_form} id="skip-settings" phx-submit="set_skip_threshold">
+                <.input
+                  field={@skip_form[:skip_threshold]}
+                  id="skip-threshold"
+                  type="number"
+                  label="Votes needed to skip"
+                  min="1"
+                  max="100"
+                  step="1"
+                  required
+                  class="playback-select"
+                />
+                <button id="save-skip-threshold" type="submit" class="settings-save">Save</button>
+                <p>Default: 3 votes. Lowering the limit can skip the current song immediately.</p>
+              </.form>
+              <.form for={@transfer_form} id="transfer-host-form" phx-submit="transfer_host">
+                <.input
+                  field={@transfer_form[:guest_id]}
+                  id="transfer-host-guest"
+                  type="select"
+                  label="Transfer host"
+                  prompt="Choose a connected guest"
+                  options={@transfer_options}
+                  required
+                  class="playback-select"
+                />
+                <button
+                  id="transfer-host"
+                  type="submit"
+                  class="settings-save"
+                  disabled={@transfer_options == []}
+                  data-confirm="Transfer host controls? You will become a guest."
+                >
+                  Pass host controls
+                </button>
+                <p>
+                  Your queue and settings stay the same. The new host keeps control when you return.
+                </p>
+              </.form>
+            </section>
+
+            <section
+              id="playlist-settings"
+              class="playlist-settings"
+              aria-label="Background playlist settings"
+            >
+              <div class="eyebrow">BACKGROUND PLAYLIST</div>
+              <p>
+                Play next requests take priority after the current song. The playlist then resumes in order.
+              </p>
+              <p :if={!@playlist_configured?} id="playlist-api-warning">
+                Set YOUTUBE_API_KEY on the server to enable playlist imports. Individual links still work.
+              </p>
+              <.form
+                for={@playlist_form}
+                id="playlist-form"
+                phx-submit="load_playlist"
+                class="playlist-form"
+              >
+                <.input
+                  field={@playlist_form[:url]}
+                  id="playlist-url"
+                  type="url"
+                  label="Public YouTube playlist URL"
+                  placeholder="https://www.youtube.com/playlist?list=…"
+                  required
+                  class="playlist-url-input"
+                />
+                <button
+                  id="load-playlist"
+                  type="submit"
+                  disabled={!is_nil(@playlist_job)}
+                  class="settings-save"
+                >
+                  {if @playlist_job, do: "Loading playlist…", else: "Load / replace playlist"}
+                </button>
+              </.form>
+              <.form
+                :if={@playlist}
+                for={@playlist_repeat_form}
+                id="playlist-repeat-form"
+                phx-change="playlist_repeat"
+              >
+                <.input
+                  field={@playlist_repeat_form[:repeat]}
+                  id="playlist-repeat"
+                  type="checkbox"
+                  label="Repeat playlist"
+                />
+              </.form>
+              <button
+                :if={@playlist || @playlist_job}
+                id="remove-playlist"
+                type="button"
+                phx-click="remove_playlist"
+                class="settings-save"
+              >Remove playlist</button>
+              <p :if={@playlist_job} id="playlist-loading" role="status">
+                Importing in the background. Playback continues.
+              </p>
+              <p :if={@playlist_error} id="playlist-error" class="error-message" role="alert">
+                {@playlist_error}
+              </p>
+            </section>
+          </div>
         </section>
 
         <main class="room-layout">
@@ -629,8 +696,36 @@ defmodule QueuePartyWeb.RoomLive do
             <div :if={@queue_count == 0} id="queue-empty" class="queue-empty">
               No individual requests.<br /><span>Add a song to play after the current video.</span>
             </div>
-            <ol id="queue" class="queue-list" phx-update="stream">
-              <li :for={{dom_id, item} <- @streams.items} id={dom_id} class="queue-item">
+            <p :if={@host?} id="queue-reorder-hint" class="queue-reorder-hint">
+              Drag the grip to reorder. You can also focus it and use the ↑ / ↓ keys.
+            </p>
+            <div id="queue-reorder-control" phx-hook="QueueReorder" phx-update="ignore">
+              <div class="queue-drop-marker" hidden></div>
+              <p class="queue-reorder-status" role="status" aria-live="polite"></p>
+            </div>
+            <ol
+              id="queue"
+              class="queue-list"
+              phx-update="stream"
+              data-reorder-enabled={to_string(@host?)}
+            >
+              <li
+                :for={{dom_id, item} <- @streams.items}
+                id={dom_id}
+                class="queue-item"
+                data-item-id={item.id}
+              >
+                <button
+                  :if={@host?}
+                  type="button"
+                  id={"reorder-#{item.id}"}
+                  class="queue-drag-handle"
+                  aria-label={"Reorder #{item.title}"}
+                  aria-describedby="queue-reorder-hint"
+                  title="Drag to reorder, or use the up and down arrow keys"
+                >
+                  <.icon name="hero-bars-3" class="queue-grip-icon" />
+                </button>
                 <span class="queue-number">{item.position}</span>
                 <img src={"https://img.youtube.com/vi/#{item.youtube_id}/mqdefault.jpg"} alt="" />
                 <div class="queue-copy">

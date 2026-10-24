@@ -25,6 +25,7 @@ import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/queue_party"
 import topbar from "../vendor/topbar"
 import YouTubePlayer from "./youtube_player.mjs"
+import QueueReorder from "./queue_reorder.mjs"
 
 const CopyRoomLink = {
   mounted() {
@@ -54,7 +55,7 @@ const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, YouTubePlayer, CopyRoomLink, VideoForm},
+  hooks: {...colocatedHooks, YouTubePlayer, CopyRoomLink, VideoForm, QueueReorder},
 })
 
 // Show progress bar on live navigation and form submits

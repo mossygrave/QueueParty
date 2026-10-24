@@ -83,6 +83,13 @@ defmodule QueueParty.Rooms do
   def remove_item(code, item_id),
     do: GenServer.call(__MODULE__, {:remove_item, String.upcase(code), item_id})
 
+  def move_item(code, host_token, item_id, before_id),
+    do:
+      GenServer.call(
+        __MODULE__,
+        {:move_item, String.upcase(code), host_token, item_id, before_id}
+      )
+
   def remove_item(code, item_id, host_token),
     do:
       GenServer.call(
@@ -301,6 +308,33 @@ defmodule QueueParty.Rooms do
       {:reply, {:ok, item}, rooms}
     else
       nil -> {:reply, {:error, :not_found}, rooms}
+    end
+  end
+
+  def handle_call({:move_item, code, host_token, item_id, before_id}, _from, rooms) do
+    case Map.get(rooms, code) do
+      %{host_token: ^host_token, items: items} = room ->
+        item = Enum.find(items, &(&1.id == item_id))
+        anchor_exists? = is_nil(before_id) || Enum.any?(items, &(&1.id == before_id))
+
+        if item && anchor_exists? && item_id != before_id do
+          remaining = Enum.reject(items, &(&1.id == item_id))
+
+          index =
+            if is_nil(before_id),
+              do: length(remaining),
+              else: Enum.find_index(remaining, &(&1.id == before_id))
+
+          save_room(%{room | items: List.insert_at(remaining, index, item)}, rooms)
+        else
+          {:reply, {:error, :stale_queue}, rooms}
+        end
+
+      nil ->
+        {:reply, {:error, :not_found}, rooms}
+
+      _ ->
+        {:reply, {:error, :forbidden}, rooms}
     end
   end
 
