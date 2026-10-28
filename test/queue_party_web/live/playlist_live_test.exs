@@ -145,7 +145,13 @@ defmodule QueuePartyWeb.PlaylistLiveTest do
     render_hook(guest, "playback_update", %{item_id: first.id, status: "playing", position: 45})
     render_hook(guest, "video_ended", %{item_id: first.id})
     assert has_element?(guest, "#now-playing-title", "Playlist B")
-    assert has_element?(guest, "#youtube-player[data-playback-position='0.0']")
+    next = Rooms.get_room(room.code)
+    assert next.playback.position == 0.0
+
+    assert has_element?(
+             guest,
+             "#youtube-player[data-item-id='#{next.now_playing.id}'][data-playback-status=playing]"
+           )
   end
 
   test "missing server key is explained and individual requests still work", %{room: room} do

@@ -38,6 +38,7 @@ defmodule QueuePartyWeb.RoomLive do
          |> assign(:playlist_form, to_form(%{"url" => ""}))
          |> assign(:playlist_job, nil)
          |> assign(:playlist_error, nil)
+         |> assign(:playlist_expanded?, false)
          |> assign(
            :playlist_configured?,
            is_binary(Application.get_env(:queue_party, :youtube_api_key)) &&
@@ -48,6 +49,15 @@ defmodule QueuePartyWeb.RoomLive do
   end
 
   @impl true
+  def handle_event("toggle_playlist_preview", _params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :playlist_expanded?,
+       !is_nil(socket.assigns.playlist) && !socket.assigns.playlist_expanded?
+     )}
+  end
+
   def handle_event("toggle_host_menu", _params, socket) do
     {:noreply,
      assign(socket, :host_menu_open?, socket.assigns.host? && !socket.assigns.host_menu_open?)}
@@ -402,6 +412,7 @@ defmodule QueuePartyWeb.RoomLive do
     |> assign(:queue_count, length(items))
     |> assign(:participant_count, length(participants))
     |> assign(:playlist, room.playlist)
+    |> assign(:playlist_expanded?, !is_nil(room.playlist) && socket.assigns.playlist_expanded?)
     |> assign(:playlist_preview_count, length(upcoming))
     |> assign(
       :playlist_repeat_form,
@@ -608,99 +619,150 @@ defmodule QueuePartyWeb.RoomLive do
         </section>
 
         <main class="room-layout">
-          <section class="player-panel">
-            <div class="eyebrow">NOW PLAYING · {if @host?, do: "HOST", else: "GUEST"}</div>
-            <p id="playback-mode-label" class="playback-mode-label">
-              {if @playback_mode == "everyone",
-                do: "Listening on every device",
-                else: "Listening on the host’s device"}
-            </p>
-            <div
-              :if={@now_playing && (@host? || @playback_mode == "everyone")}
-              id="youtube-player"
-              class="player-frame"
-              phx-hook="YouTubePlayer"
-              phx-update="ignore"
-              data-video-id={@now_playing.youtube_id}
-              data-item-id={@now_playing.id}
-              data-host={to_string(@host?)}
-              data-playback-status={@playback.status}
-              data-playback-position={@playback.position}
-              data-playback-revision={@playback.revision}
-            >
-            </div>
-            <div :if={!@host? && @now_playing && @playback_mode == "host_only"} class="guest-playing">
-              <img
-                src={"https://img.youtube.com/vi/#{@now_playing.youtube_id}/hqdefault.jpg"}
-                alt="Current video thumbnail"
-              />
-              <p>Playing on the host’s device</p>
-            </div>
-            <div
-              :if={!@host? && @now_playing && @playback_mode == "everyone"}
-              id="device-playback"
-              class="device-playback"
-            >
-              <button
-                id="enable-device-audio"
-                type="button"
-                phx-click={JS.dispatch("queueparty:enable-audio", to: "#youtube-player")}
-                class="play-first"
-                aria-describedby="device-playback-hint"
-              >Play on this device</button>
-              <p id="device-playback-hint">
-                If you don’t hear audio, tap Play here or in the YouTube player. The host controls the song; your volume is local.
+          <div id="player-column" class="player-column">
+            <section class="player-panel">
+              <div class="eyebrow">NOW PLAYING · {if @host?, do: "HOST", else: "GUEST"}</div>
+              <p id="playback-mode-label" class="playback-mode-label">
+                {if @playback_mode == "everyone",
+                  do: "Listening on every device",
+                  else: "Listening on the host’s device"}
               </p>
-            </div>
-            <div :if={!@now_playing} class="empty-player">
-              <div class="play-orb" aria-hidden="true">▶</div>
-              <h1>Drop a song into the room</h1>
-              <p>
-                Add a video and playback starts automatically. Your browser may ask you to tap Play.
-              </p>
-            </div>
-            <h2 :if={@now_playing} id="now-playing-title" class="now-playing-title">
-              {@now_playing.title}
-            </h2>
-            <div :if={@now_playing} id="now-playing" class="player-meta">
-              <div><span class="live-dot"></span>Added by {@now_playing.submitted_by}</div>
-              <button :if={@host?} id="skip-video" phx-click="skip" class="text-button">Skip to next →</button>
-            </div>
-            <section
-              :if={@now_playing}
-              id="skip-requests"
-              class="skip-requests"
-              aria-label="Skip requests"
-            >
-              <p id="skip-vote-count" role="status">
-                Skip requests: {@skip_vote_count} / {@skip_threshold}
-              </p>
-              <button
-                :if={!@host?}
-                id="request-skip"
-                type="button"
-                phx-click="request_skip"
-                phx-value-item_id={@now_playing.id}
-                disabled={@skip_voted?}
-                class="play-first"
+              <div
+                :if={@now_playing && (@host? || @playback_mode == "everyone")}
+                id="youtube-player"
+                class="player-frame"
+                phx-hook="YouTubePlayer"
+                phx-update="ignore"
+                data-video-id={@now_playing.youtube_id}
+                data-item-id={@now_playing.id}
+                data-host={to_string(@host?)}
+                data-playback-status={@playback.status}
+                data-playback-position={@playback.position}
+                data-playback-revision={@playback.revision}
               >
-                {if @skip_voted?, do: "Skip requested", else: "Request skip"}
-              </button>
-              <button
-                :if={@host? && @skip_vote_count > 0}
-                id="approve-skip"
-                type="button"
-                phx-click="approve_skip"
-                phx-value-item_id={@now_playing.id}
-                class="play-first"
+              </div>
+              <div
+                :if={!@host? && @now_playing && @playback_mode == "host_only"}
+                class="guest-playing"
               >
-                Approve skip
-              </button>
-              <p class="skip-hint">
-                The host can approve early. At {@skip_threshold} votes, the song skips automatically.
-              </p>
+                <img
+                  src={"https://img.youtube.com/vi/#{@now_playing.youtube_id}/hqdefault.jpg"}
+                  alt="Current video thumbnail"
+                />
+                <p>Playing on the host’s device</p>
+              </div>
+              <div
+                :if={!@host? && @now_playing && @playback_mode == "everyone"}
+                id="device-playback"
+                class="device-playback"
+              >
+                <button
+                  id="enable-device-audio"
+                  type="button"
+                  phx-click={JS.dispatch("queueparty:enable-audio", to: "#youtube-player")}
+                  class="play-first"
+                  aria-describedby="device-playback-hint"
+                >Play on this device</button>
+                <p id="device-playback-hint">
+                  If you don’t hear audio, tap Play here or in the YouTube player. The host controls the song; your volume is local.
+                </p>
+              </div>
+              <div :if={!@now_playing} class="empty-player">
+                <div class="play-orb" aria-hidden="true">▶</div>
+                <h1>Drop a song into the room</h1>
+                <p>
+                  Add a video and playback starts automatically. Your browser may ask you to tap Play.
+                </p>
+              </div>
+              <h2 :if={@now_playing} id="now-playing-title" class="now-playing-title">
+                {@now_playing.title}
+              </h2>
+              <div :if={@now_playing} id="now-playing" class="player-meta">
+                <div><span class="live-dot"></span>Added by {@now_playing.submitted_by}</div>
+                <button :if={@host?} id="skip-video" phx-click="skip" class="text-button">Skip to next →</button>
+              </div>
+              <section
+                :if={@now_playing}
+                id="skip-requests"
+                class="skip-requests"
+                aria-label="Skip requests"
+              >
+                <p id="skip-vote-count" role="status">
+                  Skip requests: {@skip_vote_count} / {@skip_threshold}
+                </p>
+                <button
+                  :if={!@host?}
+                  id="request-skip"
+                  type="button"
+                  phx-click="request_skip"
+                  phx-value-item_id={@now_playing.id}
+                  disabled={@skip_voted?}
+                  class="play-first"
+                >
+                  {if @skip_voted?, do: "Skip requested", else: "Request skip"}
+                </button>
+                <button
+                  :if={@host? && @skip_vote_count > 0}
+                  id="approve-skip"
+                  type="button"
+                  phx-click="approve_skip"
+                  phx-value-item_id={@now_playing.id}
+                  class="play-first"
+                >
+                  Approve skip
+                </button>
+                <p class="skip-hint">
+                  The host can approve early. At {@skip_threshold} votes, the song skips automatically.
+                </p>
+              </section>
             </section>
-          </section>
+
+            <section
+              id="background-playlist"
+              class="background-playlist playlist-card"
+              aria-label="Background playlist"
+            >
+              <div class="playlist-card-heading">
+                <div class="playlist-card-copy">
+                  <div class="eyebrow">HOST PLAYLIST</div>
+                  <%= if @playlist do %>
+                    <h2 id="playlist-title">{@playlist.title}</h2>
+                    <p id="playlist-status" role="status">
+                      {length(@playlist.tracks)} available videos · {if @playlist.repeat?,
+                        do: "Repeat on",
+                        else: "Repeat off"}
+                    </p>
+                  <% else %>
+                    <p id="no-playlist">The host can load a playlist to keep the music going.</p>
+                  <% end %>
+                </div>
+                <button
+                  :if={@playlist}
+                  id="toggle-playlist-preview"
+                  class="playlist-preview-toggle"
+                  type="button"
+                  phx-click="toggle_playlist_preview"
+                  aria-expanded={to_string(@playlist_expanded?)}
+                  aria-controls="playlist-preview"
+                >
+                  {if @playlist_expanded?, do: "Hide tracks", else: "Show tracks"}
+                  <span aria-hidden="true">{if @playlist_expanded?, do: "−", else: "+"}</span>
+                </button>
+              </div>
+              <div id="playlist-preview" class="playlist-preview" hidden={!@playlist_expanded?}>
+                <p :if={@playlist && @playlist_preview_count == 0} id="playlist-exhausted">
+                  No more playlist tracks. Add requests, load another playlist, or enable repeat.
+                </p>
+                <p :if={@playlist_preview_count > 0}>Next playlist tracks (up to 10):</p>
+                <ol id="playlist-tracks" phx-update="stream" class="queue-list">
+                  <li :for={{dom_id, track} <- @streams.playlist_items} id={dom_id} class="queue-item">
+                    <img src={"https://img.youtube.com/vi/#{track.youtube_id}/mqdefault.jpg"} alt="" />
+                    <div class="queue-copy"><strong title={track.title}>{track.title}</strong></div>
+                  </li>
+                </ol>
+              </div>
+            </section>
+          </div>
 
           <aside class="queue-panel">
             <div class="queue-heading">
@@ -757,33 +819,6 @@ defmodule QueuePartyWeb.RoomLive do
                 >×</button>
               </li>
             </ol>
-            <section
-              id="background-playlist"
-              class="background-playlist"
-              aria-label="Background playlist"
-            >
-              <div class="eyebrow">HOST PLAYLIST</div>
-              <%= if @playlist do %>
-                <h2 id="playlist-title">{@playlist.title}</h2>
-                <p id="playlist-status" role="status">
-                  {length(@playlist.tracks)} available videos · {if @playlist.repeat?,
-                    do: "Repeat on",
-                    else: "Repeat off"}
-                </p>
-                <p :if={@playlist_preview_count == 0} id="playlist-exhausted">
-                  No more playlist tracks. Add requests, load another playlist, or enable repeat.
-                </p>
-                <p :if={@playlist_preview_count > 0}>Next playlist tracks (up to 10):</p>
-              <% else %>
-                <p id="no-playlist">The host can load a playlist to keep the music going.</p>
-              <% end %>
-              <ol id="playlist-tracks" phx-update="stream" class="queue-list">
-                <li :for={{dom_id, track} <- @streams.playlist_items} id={dom_id} class="queue-item">
-                  <img src={"https://img.youtube.com/vi/#{track.youtube_id}/mqdefault.jpg"} alt="" />
-                  <div class="queue-copy"><strong title={track.title}>{track.title}</strong></div>
-                </li>
-              </ol>
-            </section>
             <section id="room-people" class="room-people" aria-labelledby="room-people-title">
               <div class="room-people-heading">
                 <h2 id="room-people-title">People in this room</h2>
