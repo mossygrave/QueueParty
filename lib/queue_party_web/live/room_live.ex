@@ -467,7 +467,7 @@ defmodule QueuePartyWeb.RoomLive do
           :if={@host?}
           id="host-controls"
           class="host-controls"
-          aria-labelledby="host-controls-title"
+          aria-label="Host controls"
           hidden={!@host_menu_open?}
           phx-window-keydown={
             if(@host_menu_open?,
@@ -476,11 +476,7 @@ defmodule QueuePartyWeb.RoomLive do
           }
           phx-key="Escape"
         >
-          <div class="host-controls-heading">
-            <div>
-              <h2 id="host-controls-title">Your room, your rules.</h2>
-              <p>Adjust the settings, then get back to the music.</p>
-            </div>
+          <div class="host-controls-heading host-controls-heading-compact">
             <button
               id="close-host-controls"
               type="button"
@@ -494,7 +490,6 @@ defmodule QueuePartyWeb.RoomLive do
             <section id="room-settings" class="room-settings" aria-label="Room settings">
               <div>
                 <div class="eyebrow">ROOM SETTINGS</div>
-                <p>Choose where everyone listens. You stay in control of playback.</p>
               </div>
               <.form
                 for={@settings_form}
@@ -881,7 +876,7 @@ defmodule QueuePartyWeb.RoomLive do
           <p :if={@error} id="room-error" class="error-message" role="alert">{@error}</p>
         </section>
 
-        <footer><span>QueueParty</span><span>Everyone’s a DJ.</span></footer>
+        <footer><span>QueueParty</span></footer>
       </div>
     </Layouts.app>
     """

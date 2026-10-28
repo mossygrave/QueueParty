@@ -37,10 +37,8 @@ defmodule QueuePartyWeb.HomeLive do
         <main class="hero">
           <div class="hero-copy">
             <div class="eyebrow">YOUTUBE · TOGETHER</div>
-            <h1>Everyone’s a DJ.<br /><em>Play something.</em></h1>
-            <p>
-              Start a room, share the code, and let the whole group build the queue from their phones.
-            </p>
+            <h1 id="home-title">Watch<br /><em>together.</em></h1>
+            <p id="home-description">Add YouTube links to a shared queue.</p>
             <div class="hero-actions">
               <button id="create-room" phx-click="create" class="primary-button">
                 Start a room <span aria-hidden="true">↗</span>
@@ -67,11 +65,6 @@ defmodule QueuePartyWeb.HomeLive do
             <div class="sticker">SHARE<br /><strong>QUEUE<br />PLAY</strong></div>
           </div>
         </main>
-        <div class="feature-strip">
-          <span><b>01</b> Create a room</span>
-          <span><b>02</b> Share the code</span>
-          <span><b>03</b> Build the vibe</span>
-        </div>
       </div>
     </Layouts.app>
     """
