@@ -32,13 +32,13 @@ defmodule QueuePartyWeb.HomeLive do
       <div class="landing">
         <nav>
           <.link navigate={~p"/"} class="brand">Queue<span>Party</span></.link>
-          <span class="nav-note">A shared listening room for the internet</span>
+          <span class="nav-note">Shared listening and watching</span>
         </nav>
         <main class="hero">
           <div class="hero-copy">
-            <div class="eyebrow">YOUTUBE · TOGETHER</div>
-            <h1 id="home-title">Watch<br /><em>together.</em></h1>
-            <p id="home-description">Add YouTube links to a shared queue.</p>
+            <div class="eyebrow"></div>
+            <h1 id="home-title">Watch<br /><em>together</em></h1>
+            <p id="home-description">Add YouTube links to a shared queue</p>
             <div class="hero-actions">
               <button id="create-room" phx-click="create" class="primary-button">
                 Start a room <span aria-hidden="true">↗</span>
